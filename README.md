@@ -187,7 +187,7 @@ src/services/api.ts
 ```
 
 This keeps API communication separate from the UI components and allows the backend endpoint to be configured using:
-
+               
 ```env
 VITE_API_BASE_URL=
 ```
@@ -206,16 +206,3 @@ Build the frontend with:
 npm run build
 ```
 
-## Files I Mainly Worked On
-
-```text
-backend/lambda/handler.py
-backend/lambda/services/ledger_service.py
-backend/lambda/tests/test_backend.py
-backend/requirements.txt
-backend/README.md
-src/services/api.ts
-docs/api-contract.md
-```
-
-This README describes **my contribution to Ledgerly**, rather than defining the complete technology stack or architecture for the entire team project.
