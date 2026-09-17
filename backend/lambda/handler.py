@@ -1,6 +1,6 @@
 ﻿"""
-Ledgerly - AWS Lambda Ingestion & DynamoDB Data Layer Handler
-Phase 2: REST Operations for Customers & Transactions + Message Ingestion
+Ledgerly - AWS Lambda Ingestion, Bedrock Extraction & DynamoDB Data Layer Handler
+Phase 3: Amazon Bedrock Natural-Language Extraction + REST Operations
 """
 
 import os
@@ -20,9 +20,15 @@ from services.ledger_service import (
     DynamoDBUnavailableError,
     LedgerValidationError,
 )
+from services.bedrock_service import (
+    BedrockService,
+    BedrockUnavailableError,
+    BedrockExtractionError,
+)
 
-# Shared service instance
+# Shared service instances
 ledger_service = LedgerService()
+bedrock_service = BedrockService()
 
 
 def _build_response(status_code: int, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -82,7 +88,7 @@ def _extract_and_validate_body(event: Dict[str, Any]) -> Tuple[bool, Any, int]:
 def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]:
     """
     Main AWS Lambda entry point supporting:
-    - POST /message (or legacy POST without route): shopkeeper natural language message
+    - POST /message (or legacy POST without route): natural language note -> Bedrock extraction
     - POST /customers: create customer
     - GET /customers: list customers (requires ?shopId=...)
     - GET /customers/{customerId}: get single customer
@@ -226,8 +232,8 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
             return _build_response(201, {"success": True, "transaction": transaction})
 
         # ---------------------------------------------------------------------
-        # FALLBACK: POST /message or legacy message ingestion
-        # (Preserves Phase 1 / Phase 2 message receipt contract)
+        # ROUTE: POST /message (or fallback message ingestion)
+        # Invokes Amazon Bedrock for transaction entity extraction
         # ---------------------------------------------------------------------
         if http_method == "POST" and (not path or path in ("/", "/message")):
             is_valid, body, status_code = _extract_and_validate_body(event)
@@ -241,15 +247,20 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
             if not isinstance(message_val, str):
                 return _build_response(400, {"success": False, "error": "Field 'message' must be a string"})
 
-            if not message_val.strip():
+            clean_message = message_val.strip()
+            if not clean_message:
                 return _build_response(400, {"success": False, "error": "Field 'message' cannot be empty"})
+
+            # Extract structured transaction via Amazon Bedrock
+            extracted_tx = bedrock_service.extract_transaction(clean_message)
 
             return _build_response(
                 200,
                 {
                     "success": True,
-                    "message": message_val.strip(),
+                    "message": clean_message,
                     "status": "received",
+                    "extractedTransaction": extracted_tx,
                 },
             )
 
@@ -269,6 +280,19 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
 
     except LedgerValidationError as e:
         return _build_response(400, {"success": False, "error": str(e)})
+
+    except BedrockExtractionError as e:
+        return _build_response(400, {"success": False, "error": f"Transaction extraction failed: {str(e)}"})
+
+    except BedrockUnavailableError as e:
+        return _build_response(
+            503,
+            {
+                "success": False,
+                "error": "Amazon Bedrock service is unavailable or not configured. Ensure AWS credentials and model access are configured.",
+                "details": str(e),
+            },
+        )
 
     except DynamoDBUnavailableError as e:
         return _build_response(

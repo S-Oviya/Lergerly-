@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Ledgerly Frontend API Client
  * Service layer to communicate with the AWS API Gateway / Lambda backend.
  */
@@ -13,10 +13,18 @@ export interface SendMessageRequest {
   message: string;
 }
 
+export interface ExtractedTransaction {
+  customerName: string;
+  type: 'CREDIT' | 'PAYMENT';
+  amount: number;
+  description: string;
+}
+
 export interface SendMessageResponse {
   success: boolean;
   message: string;
   status: string;
+  extractedTransaction?: ExtractedTransaction;
 }
 
 export interface CreateCustomerRequest {
@@ -71,6 +79,11 @@ export interface CreateTransactionResponse {
 // HTTP Helper
 // ----------------------------------------------------------------------------
 
+export interface ApiError extends Error {
+  status?: number;
+  data?: unknown;
+}
+
 async function request<T>(endpoint: string, options: RequestInit): Promise<T> {
   const url = `${API_BASE_URL}${endpoint}`;
 
@@ -88,7 +101,10 @@ async function request<T>(endpoint: string, options: RequestInit): Promise<T> {
 
   if (!response.ok) {
     const errorMsg = data?.error || data?.message || response.statusText || 'API request failed';
-    throw new Error(`API Error [${response.status}]: ${errorMsg}`);
+    const err: ApiError = new Error(`API Error [${response.status}]: ${errorMsg}`);
+    err.status = response.status;
+    err.data = data;
+    throw err;
   }
 
   return data as T;

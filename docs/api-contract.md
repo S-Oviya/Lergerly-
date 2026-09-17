@@ -1,4 +1,4 @@
-﻿# Ledgerly API Contract (Current Lambda Backend)
+# Ledgerly API Contract (Current Lambda Backend)
 
 This document specifies the exact HTTP API contract implemented in the AWS Lambda backend (`backend/lambda/handler.py` and `backend/lambda/services/ledger_service.py`).
 
@@ -9,9 +9,8 @@ All responses return standard CORS headers (`Access-Control-Allow-Origin: *`) an
 ## 1. `POST /message` (Natural-Language Ingestion)
 
 ### Purpose
-Ingestion endpoint for conversational transaction notes entered or spoken by a shopkeeper. Currently validates incoming payloads and acknowledges receipt.
-
-*(Planned for Phase 3: Passing this text to Amazon Bedrock for entity extraction.)*
+Ingestion endpoint for conversational transaction notes entered or spoken by a shopkeeper.
+Passes the natural-language text to Amazon Bedrock to extract structured transaction entities (`customerName`, `type`, `amount`, `description`).
 
 ### Request JSON
 | Field | Type | Required | Description |
@@ -33,17 +32,23 @@ Content-Type: application/json
 {
   "success": true,
   "message": "Rahul took rice for 500 on credit",
-  "status": "received"
+  "status": "received",
+  "extractedTransaction": {
+    "customerName": "Rahul",
+    "type": "CREDIT",
+    "amount": 500,
+    "description": "rice"
+  }
 }
 ```
 
-### Validation & Error Responses (`400 Bad Request`)
-- **Missing body**: `{"success": false, "error": "Missing request body"}`
-- **Empty body**: `{"success": false, "error": "Request body cannot be empty"}`
-- **Invalid JSON**: `{"success": false, "error": "Invalid JSON format"}`
-- **Missing field**: `{"success": false, "error": "Field 'message' is required"}`
-- **Empty string**: `{"success": false, "error": "Field 'message' cannot be empty"}`
-- **Non-string type**: `{"success": false, "error": "Field 'message' must be a string"}`
+### Validation & Error Responses
+- **Missing body (`400 Bad Request`)**: `{"success": false, "error": "Missing request body"}`
+- **Empty body (`400 Bad Request`)**: `{"success": false, "error": "Request body cannot be empty"}`
+- **Invalid JSON (`400 Bad Request`)**: `{"success": false, "error": "Invalid JSON format"}`
+- **Missing / empty message (`400 Bad Request`)**: `{"success": false, "error": "Field 'message' is required"}`
+- **Extraction failure (`400 Bad Request`)**: `{"success": false, "error": "Transaction extraction failed: <reason>"}`
+- **Bedrock offline / unconfigured (`503 Service Unavailable`)**: `{"success": false, "error": "Amazon Bedrock service is unavailable or not configured.", "details": "..."}`
 
 ---
 
