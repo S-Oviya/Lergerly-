@@ -3,3 +3,4 @@
 # this file is used for local development, linting, and offline test invocation.
 boto3>=1.34.0
 botocore>=1.34.0
+requests>=2.31.0

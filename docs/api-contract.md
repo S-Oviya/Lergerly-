@@ -1,30 +1,220 @@
 # Ledgerly API Contract (Current Lambda Backend)
 
-This document specifies the exact HTTP API contract implemented in the AWS Lambda backend (`backend/lambda/handler.py` and `backend/lambda/services/ledger_service.py`).
+This document specifies the exact HTTP API contract implemented in `backend/lambda/handler.py` (services: `ledger_service.py`, `bedrock_service.py`, `transcribe_service.py`, `whatsapp_service.py`).
 
-All responses return standard CORS headers (`Access-Control-Allow-Origin: *`) and JSON payloads.
+All JSON responses include `Access-Control-Allow-Origin: *` (except `GET /whatsapp/webhook` verification which returns `text/plain` challenge). `POST /whatsapp/webhook` always acks `200` to Meta to prevent retries.
 
 ---
 
-## 1. `POST /message` (Natural-Language Ingestion)
+## 1. `GET /whatsapp/webhook` — Webhook Verification
 
 ### Purpose
-Ingestion endpoint for conversational transaction notes entered or spoken by a shopkeeper.
-Passes the natural-language text to Amazon Bedrock to extract structured transaction entities (`customerName`, `type`, `amount`, `description`).
+Meta Graph API verifies the webhook during setup (`hub.mode=subscribe`).
+
+### Query Parameters
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `hub.mode` | string | **Yes** | Must be `subscribe` |
+| `hub.verify_token` | string | **Yes** | Must equal `WHATSAPP_VERIFY_TOKEN` env |
+| `hub.challenge` | string | **Yes** | Random string Meta expects back verbatim |
+
+Supports both `queryStringParameters` and `rawQueryString` (API Gateway v1/v2).
+
+### Example Request
+```http
+GET /whatsapp/webhook?hub.mode=subscribe&hub.verify_token=ledgerly_verify_2026&hub.challenge=CHALL_123
+```
+
+### Successful Response (`200 OK`, `Content-Type: text/plain`)
+```
+CHALL_123
+```
+
+### Error Responses
+- `403 Forbidden` `{"success":false,"error":"Verify token mismatch"}`
+- `403` `{"success":false,"error":"WHATSAPP_VERIFY_TOKEN is not configured on server"}`
+
+---
+
+## 2. `POST /whatsapp/webhook` — WhatsApp Inbound (Text & Voice → STT → Bedrock → Ledger → Reply)
+
+### Purpose
+Single entry for shopkeeper WhatsApp messages (text and voice notes). Executes: `download_media` (if audio) → Transcribe → Bedrock extraction → `findOrCreateCustomer` → `add_transaction` → Bedrock `generate_reply` → `send_text` (WhatsApp). Always returns `200` to ack Meta.
+
+### Headers (optional)
+| Header | Required | Description |
+|---|---|---|
+| `X-Hub-Signature-256` | No | `sha256=<hmac>` verified against `WHATSAPP_APP_SECRET` if set |
+
+### Request JSON (Meta shape)
+| Field | Type | Description |
+|---|---|---|
+| `object` | string | `whatsapp_business_account` |
+| `entry[].changes[].value.metadata.phone_number_id` | string | WABA phone number ID → resolves `shopId` via `SHOP_PHONE_MAP`/`DEFAULT_SHOP_ID` |
+| `entry[].changes[].value.messages[]` | array | Each: `{from, id (wamid), type, timestamp, text|audio/voice}` |
+| `type=text` → `text.body` | string | Text body |
+| `type=audio|voice` → `audio.id` / `voice.id`, `mime_type` | string | Media ID → Graph `GET /{id}` → `audio/ogg` bytes; supports `ogg`/`mp3`/`mp4`/`wav` |
+
+### Example Request — Text
+```http
+POST /whatsapp/webhook
+Content-Type: application/json
+
+{
+  "object": "whatsapp_business_account",
+  "entry": [{
+    "changes": [{
+      "value": {
+        "metadata": {"phone_number_id": "111"},
+        "messages": [{
+          "from": "919876543210",
+          "id": "wamid.text1",
+          "timestamp": "1710000000",
+          "type": "text",
+          "text": {"body": "Rahul took rice for 500 on credit"}
+        }]
+      }
+    }]
+  }]
+}
+```
+
+### Example Request — Voice Note
+```http
+POST /whatsapp/webhook
+Content-Type: application/json
+
+{
+  "object": "whatsapp_business_account",
+  "entry": [{
+    "changes": [{
+      "value": {
+        "metadata": {"phone_number_id": "111"},
+        "messages": [{
+          "from": "919876543210",
+          "id": "wamid.voice1",
+          "timestamp": "1710000000",
+          "type": "voice",
+          "voice": {"id": "media_123", "mime_type": "audio/ogg"}
+        }]
+      }
+    }]
+  }]
+}
+```
+
+### Successful Response (`200 OK`) — Always ack
+```json
+{
+  "success": true,
+  "status": "processed",
+  "count": 1,
+  "results": [
+    {
+      "message_id": "wamid.voice1",
+      "status": "processed",
+      "from": "919876543210",
+      "shopId": "shop001",
+      "type": "voice",
+      "transcript": "Rahul paid 300",
+      "extractedTransaction": {
+        "customerName": "Rahul",
+        "type": "PAYMENT",
+        "amount": 300,
+        "description": ""
+      },
+      "customer": {"customerId": "cust_abc123", "name": "Rahul"},
+      "transaction": {
+        "transactionId": "tx_xyz789",
+        "shopId": "shop001",
+        "customerId": "cust_abc123",
+        "type": "PAYMENT",
+        "amount": 300,
+        "description": "",
+        "createdAt": "2026-09-17T14:20:00+00:00",
+        "updatedCustomerBalance": 200
+      },
+      "balance": 200,
+      "reply": "Rahul ne ₹300 jama kiye. Bacha udhar: ₹200. 🙏",
+      "whatsapp_send": "sent",
+      "transcription_meta": {"audio_bytes_len": 12345, "transcript": "Rahul paid 300"}
+    }
+  ]
+}
+```
+
+Per-message `status` values:
+- `processed` — full pipeline succeeded (includes `whatsapp_send: sent|skipped_no_token|failed: ...`)
+- `skipped` — unsupported `type` (e.g. `image`) → `{"error":"Unsupported message type 'image'"}`
+- `failed` — `TranscriptionFailedError` (empty/silent/oversize) or `BedrockExtractionError` (invalid JSON/type/amount) — WhatsApp error text also sent if `WHATSAPP_TOKEN` set
+- `error` + `code:503` — Buddy `TranscribeUnavailableError` / `WhatsAppUnavailableError` / `DynamoDBUnavailableError` / `BedrockUnavailableError`
+
+Status updates (Meta `statuses` without `messages`) → `200 {"success":true,"status":"received","processed":0,"reason":"No messages..."}`
+
+### Validation & Error Responses
+- `403` `{"success":false,"error":"Invalid X-Hub-Signature-256"}` (HMAC mismatch)
+- `403` `{"success":false,"error":"Verify token mismatch"}` (GET verify)
+- `400` transcription `{"success":false,"error":"Transcription failed: ..."}`
+- `400` extraction `{"success":false,"error":"Transaction extraction failed: ..."}`
+- `503` `{"success":false,"error":"AWS Transcribe service is unavailable...","details":"..."}` / `WhatsApp Graph API is unavailable...` / `Amazon Bedrock service is unavailable...` / `DynamoDB service is unavailable...` — but `POST /whatsapp/webhook` still `200` with `results[].code=503` to ack Meta
+
+---
+
+## 3. `POST /whatsapp/transcribe` — Direct STT (Testing)
+
+### Purpose
+Transcribe audio without WhatsApp (for local testing). Supports `s3_uri` or `audio_base64`.
 
 ### Request JSON
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `message` | string | **Yes** | Natural language text note from the shopkeeper. Must not be empty. |
+| `s3_uri` | string | One of | `s3://bucket/key.ogg` (`ogg`/`mp3`/`mp4`/`wav`) |
+| `audio_base64` | string | One of | Base64-encoded audio bytes |
+| `media_format` | string | No | `ogg` (default), `mp3`, `mp4`, `wav` |
+| `language_code` | string | No | `en-IN` (default from `TRANSCRIBE_LANGUAGE`), `hi-IN`, `auto` |
+
+### Example Request
+```http
+POST /whatsapp/transcribe
+Content-Type: application/json
+
+{"s3_uri": "s3://ledgerly-whatsapp-audio/whatsapp/test.ogg"}
+```
+```http
+POST /whatsapp/transcribe
+Content-Type: application/json
+
+{"audio_base64": "<base64>", "media_format": "ogg", "language_code": "auto"}
+```
+
+### Successful Response (`200 OK`)
+```json
+{"success": true, "transcript": "Rahul took rice for 500 on credit"}
+```
+
+### Error Responses
+- `400` `{"success":false,"error":"Provide either 's3_uri' or 'audio_base64'"}`
+- `400` `{"success":false,"error":"Transcription failed: ... (empty/too large/timeout)"}`
+- `503` `{"success":false,"error":"AWS Transcribe service is unavailable...","details":"..."}`
+
+---
+
+## 4. `POST /message` (Natural-Language Ingestion)
+
+### Purpose
+Text-only ingestion for frontend or direct testing. Passes text to Bedrock extraction (no DB write). For WhatsApp text, prefer `POST /whatsapp/webhook`.
+
+### Request JSON
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `message` | string | **Yes** | Natural language note. Must not be empty. |
 
 ### Example Request
 ```http
 POST /message
 Content-Type: application/json
 
-{
-  "message": "Rahul took rice for 500 on credit"
-}
+{"message": "Rahul took rice for 500 on credit"}
 ```
 
 ### Successful Response (`200 OK`)
@@ -43,38 +233,29 @@ Content-Type: application/json
 ```
 
 ### Validation & Error Responses
-- **Missing body (`400 Bad Request`)**: `{"success": false, "error": "Missing request body"}`
-- **Empty body (`400 Bad Request`)**: `{"success": false, "error": "Request body cannot be empty"}`
-- **Invalid JSON (`400 Bad Request`)**: `{"success": false, "error": "Invalid JSON format"}`
-- **Missing / empty message (`400 Bad Request`)**: `{"success": false, "error": "Field 'message' is required"}`
-- **Extraction failure (`400 Bad Request`)**: `{"success": false, "error": "Transaction extraction failed: <reason>"}`
-- **Bedrock offline / unconfigured (`503 Service Unavailable`)**: `{"success": false, "error": "Amazon Bedrock service is unavailable or not configured.", "details": "..."}`
+- `400` `{"success":false,"error":"Missing request body"}` / `Invalid JSON format` / `Request body must be a JSON object`
+- `400` `{"success":false,"error":"Field 'message' is required"}` / `Field 'message' cannot be empty`
+- `400` `{"success":false,"error":"Transaction extraction failed: <reason>"}`
+- `503` `{"success":false,"error":"Amazon Bedrock service is unavailable...","details":"..."}`
 
 ---
 
-## 2. `POST /customers` (Create Customer)
-
-### Purpose
-Creates a new customer account under a specific shop.
+## 5. `POST /customers` (Create Customer)
 
 ### Required Fields
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `shopId` | string | **Yes** | Identifier of the shopkeeper's store (e.g., `"shop001"`). |
-| `name` | string | **Yes** | Customer full name (e.g., `"Rahul Sharma"`). |
-| `phone` | string | **Yes** | Customer contact phone number. |
-| `customerId` | string | No | Optional custom ID. If omitted, backend generates one (e.g., `cust_...`). |
+| `shopId` | string | **Yes** | Store ID (resolved via `SHOP_PHONE_MAP` for WhatsApp) |
+| `name` | string | **Yes** | Customer full name |
+| `phone` | string | **Yes** | Contact phone; WhatsApp flow uses `from` if not found |
+| `customerId` | string | No | Optional custom ID; auto `cust_...` if omitted |
 
 ### Example Request
 ```http
 POST /customers
 Content-Type: application/json
 
-{
-  "shopId": "shop001",
-  "name": "Rahul Sharma",
-  "phone": "+91 98765 43210"
-}
+{"shopId": "shop001", "name": "Rahul Sharma", "phone": "+91 98765 43210"}
 ```
 
 ### Successful Response (`201 Created`)
@@ -92,61 +273,39 @@ Content-Type: application/json
 }
 ```
 
-### Validation & Error Responses
-- **Missing / Empty Required Field (`400 Bad Request`)**:  
-  `{"success": false, "error": "Field '<name>' is required"}` or `{"success": false, "error": "Field '<name>' cannot be empty"}`
-- **Unconfigured DynamoDB (`503 Service Unavailable`)**:  
-  `{"success": false, "error": "DynamoDB service is unavailable or not configured...", "details": "..."}`
+### Errors
+- `400` `{"success":false,"error":"Field '<name>' is required"}` / `cannot be empty`
+- `503` `{"success":false,"error":"DynamoDB service is unavailable...","details":"..."}`
 
 ---
 
-## 3. `POST /transactions` (Record Transaction)
-
-### Purpose
-Appends a credit or payment entry to the customer's ledger and deterministically updates the customer's account balance.
+## 6. `POST /transactions` (Record Transaction)
 
 ### Required Fields & Allowed Types
-| Field | Type | Required | Constraints / Description |
+| Field | Type | Required | Constraints |
 |---|---|---|---|
-| `shopId` | string | **Yes** | Store identifier. Must not be empty. |
-| `customerId` | string | **Yes** | Customer identifier. Must not be empty. |
-| `type` | string | **Yes** | Must be either `"CREDIT"` or `"PAYMENT"`. |
-| `amount` | number | **Yes** | Transaction value in INR. Must be strictly greater than 0. |
-| `description` | string | No | Optional goods note or item description. |
-| `dueDate` | string | No | Optional promised payment date (e.g., `"2026-09-20"`). |
-| `transactionId`| string | No | Optional custom transaction ID. Auto-generated if omitted. |
+| `shopId` | string | **Yes** | Must not be empty |
+| `customerId` | string | **Yes** | Must not be empty |
+| `type` | string | **Yes** | `CREDIT` (udhar, +balance) or `PAYMENT` (jama, -balance) |
+| `amount` | number | **Yes** | `> 0` |
+| `description` | string | No | Goods note |
+| `dueDate` | string | No | Promise date `2026-09-20` |
+| `transactionId` | string | No | Auto `tx_...` if omitted |
 
-### Allowed Transaction Types:
-- **`CREDIT`**: Customer took items on credit (*udhar*). Increases balance owed.
-- **`PAYMENT`**: Customer made a cash/UPI payment. Decreases balance owed.
-
-### Example Request 1: CREDIT Purchase
+### Example Request — CREDIT
 ```http
 POST /transactions
 Content-Type: application/json
 
-{
-  "shopId": "shop001",
-  "customerId": "cust_9e7f6a2b1c0d",
-  "type": "CREDIT",
-  "amount": 500,
-  "description": "2 packets of basmati rice",
-  "dueDate": "2026-09-20"
-}
+{"shopId":"shop001","customerId":"cust_9e7f6a2b1c0d","type":"CREDIT","amount":500,"description":"2 packets of basmati rice","dueDate":"2026-09-20"}
 ```
 
-### Example Request 2: PAYMENT Settlement
+### Example Request — PAYMENT
 ```http
 POST /transactions
 Content-Type: application/json
 
-{
-  "shopId": "shop001",
-  "customerId": "cust_9e7f6a2b1c0d",
-  "type": "PAYMENT",
-  "amount": 300,
-  "description": "Partial cash payment"
-}
+{"shopId":"shop001","customerId":"cust_9e7f6a2b1c0d","type":"PAYMENT","amount":300,"description":"Partial cash payment"}
 ```
 
 ### Successful Response (`201 Created`)
@@ -167,42 +326,58 @@ Content-Type: application/json
 }
 ```
 
-### Validation & Error Responses
-- **Missing Required Fields (`400 Bad Request`)**:  
-  `{"success": false, "error": "Field '<name>' is required"}`
-- **Invalid Type (`400 Bad Request`)**:  
-  `{"success": false, "error": "Transaction type must be CREDIT or PAYMENT"}`
-- **Invalid Amount (`400 Bad Request`)**:  
-  `{"success": false, "error": "amount must be greater than zero"}`
-- **Unconfigured DynamoDB (`503 Service Unavailable`)**:  
-  `{"success": false, "error": "DynamoDB service is unavailable or not configured...", "details": "..."}`
+### Errors
+- `400` `Field '<name>' is required` / `cannot be empty`
+- `400` `Transaction type must be CREDIT or PAYMENT`
+- `400` `amount must be greater than zero` / `amount must be a numeric value`
+- `503` `DynamoDB service is unavailable...`
 
 ---
 
-## 4. Deterministic Financial Rule
+## 7. `GET /customers`, `GET /customers/{customerId}`, `GET /customers/{customerId}/transactions`
 
-In Ledgerly, financial arithmetic is strictly deterministic and handled exclusively by backend code:
-
-$$\text{Customer Balance} = \sum \text{Total CREDIT} - \sum \text{Total PAYMENT}$$
-
-- **CREDIT** transactions add to the balance ($+$).
-- **PAYMENT** transactions subtract from the balance ($-$).
-- **No LLM Calculation**: The AI model (Amazon Bedrock) is only used for entity extraction from text; it is **never** permitted to calculate balances.
+| Route | Query | Success | Errors |
+|---|---|---|---|
+| `GET /customers?shopId=shop001` | `shopId` required | `200 {"success":true,"customers":[...],"count":n}` | `400 shopId required`, `503 DynamoDB` |
+| `GET /customers/{customerId}?shopId=optional` | optional `shopId` filter | `200 {"success":true,"customer":{...}}` | `404 Customer '...' not found` |
+| `GET /customers/{customerId}/transactions?shopId=optional` | optional `shopId` | `200 {"success":true,"customerId":"...","balance":500,"transactions":[...],"count":n}` (sorted reverse `createdAt`) | `400 customerId cannot be empty` |
 
 ---
 
-## 5. Frontend Integration Notes (Planned for Phase 4)
+## 8. Deterministic Financial Rule
 
-Currently, the React frontend runs locally with mock data and deterministic client-side calculation rules. When integrating with this backend in Phase 4:
+$$\text{Customer Balance} = \sum \text{CREDIT} - \sum \text{PAYMENT}$$
 
-1. **Base URL Configuration**:
-   - The frontend will configure an environment variable: `VITE_API_BASE_URL` pointing to the deployed Amazon API Gateway endpoint (or local mock server).
-2. **Shop Identification**:
-   - The frontend should include a fixed `shopId` (e.g. `"shop001"`) in customer and transaction payloads.
-3. **Voice & Text Command Bar**:
-   - The frontend natural language input bar will send `{ "message": userText }` to `POST /message`.
-4. **Manual Forms & Modals**:
-   - The "Add Customer" modal will send `{ shopId, name, phone }` to `POST /customers`.
-   - The "Add Transaction" modal will send `{ shopId, customerId, type, amount, description, dueDate }` to `POST /transactions`.
-5. **Synchronous Balance Updates**:
-   - `POST /transactions` returns `updatedCustomerBalance` in the response, allowing the React UI to update the customer's balance badge without a separate round trip.
+- **Bedrock extracts**, `ledger_service.calculate_customer_balance` computes via `Decimal`.
+- **Reply generation** uses the deterministic `updatedCustomerBalance` (fallback template if Bedrock generation 503).
+
+---
+
+## 9. CORS & Common Errors
+
+All routes return `Access-Control-Allow-Origin: *`, `Allow-Headers: Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token`, `Allow-Methods: GET,POST,OPTIONS`. `OPTIONS *` → `200 {"success":true,"status":"preflight_ok"}`.
+
+| Status | When |
+|---|---|
+| `400` | Validation (empty/invalid JSON/type/amount, transcription silent) |
+| `403` | Webhook verify/signature mismatch |
+| `404` | Route not found / customer not found |
+| `405` | Method not `GET,POST` |
+| `503` | Bedrock / Transcribe / WhatsApp / DynamoDB unconfigured (`details` included) |
+| `500` | Internal error (`details` included) |
+
+---
+
+## 10. Frontend Integration Notes
+
+* `VITE_API_BASE_URL` points to API Gateway.
+* `shopId` is fixed `shop001` or resolved via `SHOP_PHONE_MAP` for WhatsApp.
+* Text bar → `POST /message`; WhatsApp voice → Meta → `POST /whatsapp/webhook` (bypasses frontend).
+* `POST /transactions` returns `updatedCustomerBalance` for optimistic UI.
+
+---
+
+## 11. Environment Variables Reference
+
+See `.env.example` and `backend/README.md` table for `WHATSAPP_*`, `TRANSCRIBE_*`, `AWS_REGION`, `BEDROCK_MODEL_ID`, `CUSTOMERS_TABLE`, `TRANSACTIONS_TABLE`.
+

@@ -8,6 +8,7 @@ import sys
 import json
 import re
 import base64
+import urllib.parse
 from typing import Any, Dict, Tuple, Optional
 
 # Ensure services directory is resolvable in Lambda and local test runs
@@ -25,10 +26,22 @@ from services.bedrock_service import (
     BedrockUnavailableError,
     BedrockExtractionError,
 )
+from services.transcribe_service import (
+    TranscribeService,
+    TranscribeUnavailableError,
+    TranscriptionFailedError,
+)
+from services.whatsapp_service import (
+    WhatsAppService,
+    WhatsAppUnavailableError,
+    WhatsAppValidationError,
+)
 
 # Shared service instances
 ledger_service = LedgerService()
 bedrock_service = BedrockService()
+whatsapp_service = WhatsAppService()
+transcribe_service = TranscribeService()
 
 
 def _build_response(status_code: int, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -88,6 +101,9 @@ def _extract_and_validate_body(event: Dict[str, Any]) -> Tuple[bool, Any, int]:
 def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]:
     """
     Main AWS Lambda entry point supporting:
+    - GET  /whatsapp/webhook  : Meta webhook verification (hub.challenge)
+    - POST /whatsapp/webhook  : WhatsApp inbound (text/voice) -> STT -> Bedrock -> Ledger -> WhatsApp reply
+    - POST /whatsapp/transcribe: Direct audio -> Transcribe (testing)
     - POST /message (or legacy POST without route): natural language note -> Bedrock extraction
     - POST /customers: create customer
     - GET /customers: list customers (requires ?shopId=...)
@@ -113,7 +129,278 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
     path_params = event.get("pathParameters") or {}
     query_params = event.get("queryStringParameters") or {}
 
+    # ---------------------------------------------------------------------
+    # Helpers for WhatsApp -> STT -> LLM -> Ledger
+    # ---------------------------------------------------------------------
+    def _resolve_shop_id(phone_number_id: str) -> str:
+        return whatsapp_service.resolve_shop_id(phone_number_id or "")
+
+    def _find_or_create_customer(shop_id: str, customer_name: str, fallback_phone: str) -> Dict[str, Any]:
+        """Finds existing customer by name (case-insensitive) or creates new one."""
+        try:
+            customers = ledger_service.list_customers(shop_id)
+        except Exception:
+            customers = []
+        normalized = customer_name.strip().lower()
+        for c in customers:
+            if str(c.get("name", "")).strip().lower() == normalized:
+                return c
+            # Also match first name contains for WhatsApp informal names
+            if normalized in str(c.get("name", "")).strip().lower() or str(c.get("name", "")).strip().lower() in normalized:
+                # Prefer exact but allow fuzzy
+                pass
+        # Exact match not found - check fuzzy first token
+        for c in customers:
+            first = str(c.get("name", "")).strip().split()[0].lower() if c.get("name") else ""
+            if first and first == normalized.split()[0]:
+                return c
+        # Create new
+        phone = fallback_phone.strip() if fallback_phone and fallback_phone.strip() else "+91 00000 00000"
+        return ledger_service.create_customer(shop_id=shop_id, name=customer_name.strip(), phone=phone)
+
+    def _process_whatsapp_single_message(msg: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Processes a single WhatsApp message (text or audio) through STT -> Bedrock -> Ledger.
+        Returns result dict for response aggregation.
+        """
+        from_number = msg.get("from", "")
+        phone_number_id = msg.get("phone_number_id", "")
+        msg_id = msg.get("message_id", "")
+        mtype = msg.get("type", "")
+        shop_id = _resolve_shop_id(phone_number_id)
+
+        # 1. Extract raw text
+        raw_text = ""
+        transcription_meta: Dict[str, Any] = {}
+        if mtype == "text":
+            raw_text = str(msg.get("text", "")).strip()
+            if not raw_text:
+                return {"message_id": msg_id, "status": "failed", "error": "Empty text message", "from": from_number}
+        elif mtype in ("audio", "voice"):
+            audio_id = msg.get("audio_id", "")
+            if not audio_id:
+                return {"message_id": msg_id, "status": "failed", "error": "Missing audio id", "from": from_number}
+            try:
+                audio_bytes = whatsapp_service.download_media(audio_id)
+                transcription_meta["audio_bytes_len"] = len(audio_bytes)
+                # Determine media format from mime
+                mime = str(msg.get("mime_type", "audio/ogg")).lower()
+                media_format = "ogg"
+                if "mpeg" in mime or "mp3" in mime:
+                    media_format = "mp3"
+                elif "mp4" in mime:
+                    media_format = "mp4"
+                elif "wav" in mime:
+                    media_format = "wav"
+                raw_text = transcribe_service.transcribe_audio_bytes(audio_bytes, media_format=media_format)
+                transcription_meta["transcript"] = raw_text
+            except (TranscriptionFailedError, WhatsAppValidationError) as e:
+                error_msg = str(e)
+                # Try to notify user via WhatsApp if possible
+                try:
+                    whatsapp_service.send_text(from_number, f"Voice note samajh nahi paya: {error_msg}. Kripya dobara bhejein ya text me likhein. 🙏", phone_number_id)
+                except Exception:
+                    pass
+                return {"message_id": msg_id, "status": "failed", "error": f"Transcription failed: {error_msg}", "from": from_number, "shopId": shop_id}
+            except (TranscribeUnavailableError, WhatsAppUnavailableError) as e:
+                error_msg = str(e)
+                return {"message_id": msg_id, "status": "error", "error": f"Service unavailable: {error_msg}", "from": from_number, "shopId": shop_id, "code": 503}
+        else:
+            return {"message_id": msg_id, "status": "skipped", "error": f"Unsupported message type '{mtype}'", "from": from_number}
+
+        if not raw_text or not raw_text.strip():
+            return {"message_id": msg_id, "status": "failed", "error": "Transcript/text is empty", "from": from_number}
+
+        # 2. Bedrock extraction
+        try:
+            extracted = bedrock_service.extract_transaction(raw_text.strip())
+        except BedrockExtractionError as e:
+            try:
+                whatsapp_service.send_text(from_number, f"Samajh nahi paya: {str(e)}. Kripya naam, rakam aur udhar/jama sahi se bhejein. 🙏", phone_number_id)
+            except Exception:
+                pass
+            return {"message_id": msg_id, "status": "failed", "error": f"Extraction failed: {str(e)}", "from": from_number, "transcript": raw_text, "shopId": shop_id}
+        except BedrockUnavailableError as e:
+            return {"message_id": msg_id, "status": "error", "error": f"Bedrock unavailable: {str(e)}", "from": from_number, "transcript": raw_text, "code": 503}
+
+        # 3. Ledger: find or create customer, add transaction
+        try:
+            customer = _find_or_create_customer(shop_id, extracted["customerName"], from_number)
+            customer_id = customer.get("customerId", "")
+            transaction = ledger_service.add_transaction(
+                shop_id=shop_id,
+                customer_id=customer_id,
+                tx_type=extracted["type"],
+                amount=extracted["amount"],
+                description=extracted.get("description", ""),
+            )
+            balance = transaction.get("updatedCustomerBalance", 0)
+        except (LedgerValidationError, DynamoDBUnavailableError) as e:
+            code = 503 if isinstance(e, DynamoDBUnavailableError) else 400
+            return {"message_id": msg_id, "status": "error" if code == 503 else "failed", "error": str(e), "from": from_number, "extracted": extracted, "transcript": raw_text, "code": code}
+        except Exception as e:
+            return {"message_id": msg_id, "status": "error", "error": f"Ledger error: {str(e)}", "from": from_number, "extracted": extracted, "transcript": raw_text}
+
+        # 4. Generate reply (Bedrock generation, fallback template inside service)
+        try:
+            reply_text = bedrock_service.generate_reply(extracted, balance, raw_text)
+        except Exception:
+            # Ultimate fallback
+            typ = extracted.get("type", "")
+            amt = extracted.get("amount", "")
+            reply_text = f"{extracted.get('customerName')} ke liye {amt} ({typ}) record kiya. Balance: {balance}. ✅"
+
+        # 5. Send WhatsApp reply (best-effort)
+        wa_send_status = "skipped"
+        wa_response = None
+        try:
+            if whatsapp_service.access_token and from_number:
+                wa_response = whatsapp_service.send_text(from_number, reply_text, phone_number_id)
+                wa_send_status = "sent"
+            else:
+                wa_send_status = "skipped_no_token"
+        except (WhatsAppUnavailableError, WhatsAppValidationError) as e:
+            wa_send_status = f"failed: {str(e)}"
+        except Exception as e:
+            wa_send_status = f"failed: {str(e)}"
+
+        result: Dict[str, Any] = {
+            "message_id": msg_id,
+            "status": "processed",
+            "from": from_number,
+            "shopId": shop_id,
+            "type": mtype,
+            "transcript": raw_text,
+            "extractedTransaction": extracted,
+            "customer": {"customerId": customer.get("customerId"), "name": customer.get("name")},
+            "transaction": transaction,
+            "balance": balance,
+            "reply": reply_text,
+            "whatsapp_send": wa_send_status,
+        }
+        if wa_response:
+            result["whatsapp_response"] = wa_response
+        if transcription_meta:
+            result["transcription_meta"] = transcription_meta
+        return result
+
     try:
+        # ---------------------------------------------------------------------
+        # ROUTE: GET /whatsapp/webhook (verification)
+        # ---------------------------------------------------------------------
+        if path in ("/whatsapp/webhook", "/whatsapp") and http_method == "GET":
+            # Support both queryStringParameters and raw query parsing
+            challenge = query_params.get("hub.challenge") or query_params.get("hub_challenge") or ""
+            mode = query_params.get("hub.mode") or query_params.get("hub_mode") or ""
+            token = query_params.get("hub.verify_token") or query_params.get("hub_verify_token") or ""
+            # Fallback: parse raw query string if API Gateway uses different shape
+            if not challenge and event.get("rawQueryString"):
+                try:
+                    qs = urllib.parse.parse_qs(event.get("rawQueryString", ""))
+                    challenge = qs.get("hub.challenge", [""])[0]
+                    mode = qs.get("hub.mode", [""])[0]
+                    token = qs.get("hub.verify_token", [""])[0]
+                except Exception:
+                    pass
+            # Use service verification
+            qp = {"hub.mode": mode, "hub.verify_token": token, "hub.challenge": challenge}
+            ok, result = whatsapp_service.verify_webhook(qp)
+            if ok:
+                # Must return challenge as plain text per Meta spec; support both text and JSON for testing
+                return {
+                    "statusCode": 200,
+                    "headers": {
+                        "Content-Type": "text/plain",
+                        "Access-Control-Allow-Origin": "*",
+                    },
+                    "body": result,
+                }
+            else:
+                return _build_response(403, {"success": False, "error": result})
+
+        # ---------------------------------------------------------------------
+        # ROUTE: POST /whatsapp/webhook (inbound WhatsApp messages)
+        # ---------------------------------------------------------------------
+        if path in ("/whatsapp/webhook", "/whatsapp") and http_method == "POST":
+            # Optional signature verification
+            raw_body_str = ""
+            if isinstance(event.get("body"), str):
+                raw_body_str = event.get("body") or ""
+                if event.get("isBase64Encoded"):
+                    try:
+                        raw_body_str = base64.b64decode(raw_body_str).decode("utf-8")
+                    except Exception:
+                        pass
+            elif isinstance(event.get("body"), dict):
+                raw_body_str = json.dumps(event.get("body"))
+            sig = event.get("headers", {}).get("X-Hub-Signature-256") or event.get("headers", {}).get("x-hub-signature-256") or ""
+            if sig and not whatsapp_service.verify_signature(raw_body_str, sig):
+                return _build_response(403, {"success": False, "error": "Invalid X-Hub-Signature-256"})
+
+            is_valid, body, status_code = _extract_and_validate_body(event)
+            if not is_valid:
+                # WhatsApp always expects 200 to avoid retries, but for validation we return 400 for direct API callers
+                # Check if this is a real WhatsApp webhook (has entry->changes)
+                has_whatsapp_shape = isinstance(body, dict) and isinstance(body.get("entry"), list) if isinstance(body, dict) else False
+                if has_whatsapp_shape:
+                    return _build_response(200, {"success": True, "status": "ignored", "reason": body.get("error", "Invalid body shape")})
+                return _build_response(status_code, body)
+
+            # Parse messages (empty list means status updates, delivery receipts -> ack)
+            try:
+                parsed_messages = whatsapp_service.parse_webhook(body)
+            except WhatsAppValidationError as e:
+                return _build_response(200, {"success": True, "status": "ignored", "reason": str(e)})
+
+            if not parsed_messages:
+                return _build_response(200, {"success": True, "status": "received", "processed": 0, "reason": "No messages in webhook (likely status update)"})
+
+            results = []
+            for m in parsed_messages:
+                res = _process_whatsapp_single_message(m)
+                results.append(res)
+
+            # Determine overall HTTP status: if all 503 -> 503 for observability, else 200 (WhatsApp expects 200)
+            # For Graph API webhook, we must return 200 to stop retries, even on internal errors.
+            is_whatsapp_webhook = True
+            # Heuristic: if request came from Graph API, it will have entry field
+            if body.get("object") == "whatsapp_business_account" or body.get("entry"):
+                # Always 200 for WhatsApp to ack
+                return _build_response(200, {"success": True, "status": "processed", "count": len(results), "results": results})
+            # For direct API test callers, surface first error code if any 503
+            has_503 = any(r.get("code") == 503 for r in results)
+            if has_503:
+                return _build_response(200, {"success": True, "status": "processed_with_unavailable", "count": len(results), "results": results})
+            return _build_response(200, {"success": True, "status": "processed", "count": len(results), "results": results})
+
+        # ---------------------------------------------------------------------
+        # ROUTE: POST /whatsapp/transcribe (direct audio->text for testing without WhatsApp)
+        # ---------------------------------------------------------------------
+        if path == "/whatsapp/transcribe" and http_method == "POST":
+            is_valid, body, status_code = _extract_and_validate_body(event)
+            if not is_valid:
+                return _build_response(status_code, body)
+            # Support either s3_uri or base64 audio
+            s3_uri = body.get("s3_uri") or body.get("s3Uri") or ""
+            audio_b64 = body.get("audio_base64") or body.get("audioBase64") or ""
+            media_format = body.get("media_format") or body.get("mediaFormat") or "ogg"
+            language_code = body.get("language_code") or body.get("languageCode") or None
+            try:
+                if s3_uri and s3_uri.strip():
+                    text = transcribe_service.transcribe_s3_uri(s3_uri.strip(), language_code=language_code, media_format=media_format)
+                elif audio_b64 and audio_b64.strip():
+                    import base64 as _b64
+                    audio_bytes = _b64.b64decode(audio_b64.strip())
+                    text = transcribe_service.transcribe_audio_bytes(audio_bytes, media_format=media_format, language_code=language_code)
+                else:
+                    return _build_response(400, {"success": False, "error": "Provide either 's3_uri' or 'audio_base64'"})
+                return _build_response(200, {"success": True, "transcript": text})
+            except (TranscriptionFailedError, TranscribeUnavailableError) as e:
+                code = 503 if isinstance(e, TranscribeUnavailableError) else 400
+                return _build_response(code, {"success": False, "error": str(e)})
+            except Exception as e:
+                return _build_response(500, {"success": False, "error": "Transcription error", "details": str(e)})
+
         # ---------------------------------------------------------------------
         # ROUTE: POST /customers
         # ---------------------------------------------------------------------
@@ -293,6 +580,32 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
                 "details": str(e),
             },
         )
+
+    except TranscribeUnavailableError as e:
+        return _build_response(
+            503,
+            {
+                "success": False,
+                "error": "AWS Transcribe service is unavailable or not configured. Ensure TRANSCRIBE_S3_BUCKET and AWS credentials are configured.",
+                "details": str(e),
+            },
+        )
+
+    except TranscriptionFailedError as e:
+        return _build_response(400, {"success": False, "error": f"Transcription failed: {str(e)}"})
+
+    except WhatsAppUnavailableError as e:
+        return _build_response(
+            503,
+            {
+                "success": False,
+                "error": "WhatsApp Graph API is unavailable or not configured. Ensure WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID are configured.",
+                "details": str(e),
+            },
+        )
+
+    except WhatsAppValidationError as e:
+        return _build_response(400, {"success": False, "error": str(e)})
 
     except DynamoDBUnavailableError as e:
         return _build_response(
