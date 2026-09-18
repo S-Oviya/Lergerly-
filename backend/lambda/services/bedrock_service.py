@@ -62,6 +62,20 @@ CRITICAL RULES:
 - Do NOT output markdown code blocks (no ```json). Output raw JSON only."""
 
 
+REPLY_SYSTEM_PROMPT = """You are Ledgerly, a friendly kirana store assistant replying via WhatsApp.
+Given a newly recorded transaction and the customer's updated balance, generate a concise WhatsApp reply.
+
+Rules:
+- Keep it 1-2 lines, under 300 characters.
+- Include: customer name, amount with ₹, CREDIT/udhar vs PAYMENT/jama, and updated balance (provided to you).
+- Language: match user's language (Hindi/English mix is okay, default to Hindi-English Hinglish if transcription was Hindi).
+- Never guess or recalculate balance - use the exact balance provided.
+- For CREDIT: e.g. "Rahul ke khate me ₹500 udhar joda. Kul udhar: ₹1200."
+- For PAYMENT: e.g. "Rahul ne ₹300 jama kiye. Bacha udhar: ₹900. Dhanyavad!"
+- Add a small emoji (✅ or 🙏) at end.
+- Do NOT output JSON, output plain text reply only."""
+
+
 class BedrockService:
     def __init__(
         self,
@@ -279,3 +293,85 @@ class BedrockService:
 
         model_text = self._extract_text_from_response(response_data)
         return self.parse_and_validate_extraction(model_text)
+
+    def _build_reply_payload(self, extracted: Dict[str, Any], balance: Any, original_text: str) -> Dict[str, Any]:
+        model_lower = self.model_id.lower()
+        user_content = (
+            f"Original shopkeeper note: \"{original_text}\"\n"
+            f"Extracted transaction: customerName={extracted.get('customerName')}, type={extracted.get('type')}, amount={extracted.get('amount')}, description={extracted.get('description','')}\n"
+            f"Updated customer balance (deterministic, do NOT recalculate): {balance}\n"
+            f"Generate WhatsApp reply:"
+        )
+        if "anthropic" in model_lower:
+            return {
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 256,
+                "temperature": 0.3,
+                "system": REPLY_SYSTEM_PROMPT,
+                "messages": [{"role": "user", "content": user_content}],
+            }
+        elif "titan" in model_lower:
+            prompt = f"{REPLY_SYSTEM_PROMPT}\n\n{user_content}\nReply:"
+            return {
+                "inputText": prompt,
+                "textGenerationConfig": {"maxTokenCount": 256, "temperature": 0.3, "stopSequences": ["\n\n"]},
+            }
+        else:
+            return {
+                "prompt": f"{REPLY_SYSTEM_PROMPT}\n\n{user_content}\nReply:",
+                "max_gen_len": 256,
+                "temperature": 0.3,
+            }
+
+    def generate_reply(self, extracted: Dict[str, Any], balance: Any, original_text: str) -> str:
+        """
+        Generates a human-friendly WhatsApp reply via Bedrock.
+        Falls back to deterministic template if Bedrock is unavailable.
+        """
+        if not extracted or not isinstance(extracted, dict):
+            raise BedrockExtractionError("extracted transaction is required for reply generation")
+        try:
+            client = self._get_client()
+            payload = self._build_reply_payload(extracted, balance, original_text)
+            response = client.invoke_model(
+                modelId=self.model_id,
+                body=json.dumps(payload),
+                contentType="application/json",
+                accept="application/json",
+            )
+            raw_body = response.get("body")
+            if hasattr(raw_body, "read"):
+                response_data = json.loads(raw_body.read().decode("utf-8"))
+            elif isinstance(raw_body, (str, bytes)):
+                response_data = json.loads(raw_body)
+            elif isinstance(raw_body, dict):
+                response_data = raw_body
+            else:
+                response_data = {}
+            text = self._extract_text_from_response(response_data).strip()
+            if not text:
+                raise BedrockExtractionError("Reply generation returned empty response")
+            # Sanitize: remove code fences if any, truncate
+            if text.startswith("```"):
+                text = re.sub(r"^```(?:[\w]+)?\s*", "", text)
+                text = re.sub(r"\s*```$", "", text)
+            return text.strip()[:500]
+        except (BedrockUnavailableError, BedrockExtractionError):
+            # Deterministic fallback template (no Bedrock needed)
+            name = str(extracted.get("customerName", "Customer")).strip() or "Customer"
+            amt = extracted.get("amount", "")
+            typ = str(extracted.get("type", "")).strip().upper()
+            try:
+                bal_str = f"₹{int(balance) if float(balance) % 1 == 0 else balance}"
+            except Exception:
+                bal_str = f"₹{balance}"
+            try:
+                amt_str = f"₹{int(amt) if float(amt) % 1 == 0 else amt}"
+            except Exception:
+                amt_str = f"₹{amt}"
+            if typ == "CREDIT":
+                return f"{name} ke khate me {amt_str} udhar joda. Kul udhar: {bal_str}. ✅"
+            elif typ == "PAYMENT":
+                return f"{name} ne {amt_str} jama kiye. Bacha udhar: {bal_str}. Dhanyavad! 🙏"
+            else:
+                return f"{name} ke liye {amt_str} ({typ}) record kiya. Kul balance: {bal_str}. ✅"

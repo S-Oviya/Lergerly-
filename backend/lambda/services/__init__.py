@@ -10,6 +10,18 @@ from services.bedrock_service import (
     BedrockUnavailableError,
     BedrockExtractionError,
 )
+from services.transcribe_service import (
+    TranscribeService,
+    TranscribeError,
+    TranscribeUnavailableError,
+    TranscriptionFailedError,
+)
+from services.whatsapp_service import (
+    WhatsAppService,
+    WhatsAppError,
+    WhatsAppUnavailableError,
+    WhatsAppValidationError,
+)
 
 __all__ = [
     "LedgerService",
@@ -19,4 +31,12 @@ __all__ = [
     "BedrockError",
     "BedrockUnavailableError",
     "BedrockExtractionError",
+    "TranscribeService",
+    "TranscribeError",
+    "TranscribeUnavailableError",
+    "TranscriptionFailedError",
+    "WhatsAppService",
+    "WhatsAppError",
+    "WhatsAppUnavailableError",
+    "WhatsAppValidationError",
 ]
