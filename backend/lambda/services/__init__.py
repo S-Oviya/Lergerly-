@@ -15,6 +15,9 @@ from services.transcribe_service import (
     TranscribeError,
     TranscribeUnavailableError,
     TranscriptionFailedError,
+    SUPPORTED_AWS,
+    SHORT_TO_AWS,
+    normalize_language_code,
 )
 from services.whatsapp_service import (
     WhatsAppService,
@@ -22,6 +25,11 @@ from services.whatsapp_service import (
     WhatsAppUnavailableError,
     WhatsAppValidationError,
 )
+try:
+    from services.whisper_service import WhisperService, WhisperError, WhisperUnavailableError, WhisperTranscriptionFailedError
+except ImportError:
+    WhisperService = None
+    WhisperError = WhisperUnavailableError = WhisperTranscriptionFailedError = Exception
 
 __all__ = [
     "LedgerService",
@@ -35,8 +43,15 @@ __all__ = [
     "TranscribeError",
     "TranscribeUnavailableError",
     "TranscriptionFailedError",
+    "SUPPORTED_AWS",
+    "SHORT_TO_AWS",
+    "normalize_language_code",
     "WhatsAppService",
     "WhatsAppError",
     "WhatsAppUnavailableError",
     "WhatsAppValidationError",
+    "WhisperService",
+    "WhisperError",
+    "WhisperUnavailableError",
+    "WhisperTranscriptionFailedError",
 ]

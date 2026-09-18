@@ -25,17 +25,25 @@ from services.bedrock_service import (
     BedrockService,
     BedrockUnavailableError,
     BedrockExtractionError,
+    detect_language_from_text,
 )
 from services.transcribe_service import (
     TranscribeService,
     TranscribeUnavailableError,
     TranscriptionFailedError,
+    normalize_language_code,
+    SUPPORTED_AWS,
 )
 from services.whatsapp_service import (
     WhatsAppService,
     WhatsAppUnavailableError,
     WhatsAppValidationError,
 )
+try:
+    from services.whisper_service import WhisperService, WhisperUnavailableError, WhisperTranscriptionFailedError
+except ImportError:
+    WhisperService = None
+    WhisperUnavailableError = WhisperTranscriptionFailedError = Exception
 
 # Shared service instances
 ledger_service = LedgerService()
@@ -135,32 +143,52 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
     def _resolve_shop_id(phone_number_id: str) -> str:
         return whatsapp_service.resolve_shop_id(phone_number_id or "")
 
-    def _find_or_create_customer(shop_id: str, customer_name: str, fallback_phone: str) -> Dict[str, Any]:
-        """Finds existing customer by name (case-insensitive) or creates new one."""
+    def _find_or_create_customer(shop_id: str, customer_name: str, fallback_phone: str, preferred_language: Optional[str] = None) -> Dict[str, Any]:
+        """Finds existing customer by name (case-insensitive incl. unicode) or creates new one with language."""
         try:
             customers = ledger_service.list_customers(shop_id)
         except Exception:
             customers = []
         normalized = customer_name.strip().lower()
+        # Exact case-insensitive match first (unicode-safe)
         for c in customers:
             if str(c.get("name", "")).strip().lower() == normalized:
+                # Update preferredLanguage if we have new hint
+                if preferred_language and c.get("preferredLanguage") != preferred_language:
+                    try:
+                        # Best-effort update via ledger_service if method exists
+                        if hasattr(ledger_service, "update_customer_language"):
+                            ledger_service.update_customer_language(c.get("customerId"), preferred_language)
+                    except Exception:
+                        pass
                 return c
-            # Also match first name contains for WhatsApp informal names
-            if normalized in str(c.get("name", "")).strip().lower() or str(c.get("name", "")).strip().lower() in normalized:
-                # Prefer exact but allow fuzzy
-                pass
-        # Exact match not found - check fuzzy first token
+        # Fuzzy first-token match (supports multilingual names)
+        first_in = normalized.split()[0] if normalized.split() else ""
         for c in customers:
-            first = str(c.get("name", "")).strip().split()[0].lower() if c.get("name") else ""
-            if first and first == normalized.split()[0]:
+            cname = str(c.get("name", "")).strip().lower()
+            first_c = cname.split()[0] if cname.split() else ""
+            if first_in and first_c and first_in == first_c:
                 return c
         # Create new
         phone = fallback_phone.strip() if fallback_phone and fallback_phone.strip() else "+91 00000 00000"
-        return ledger_service.create_customer(shop_id=shop_id, name=customer_name.strip(), phone=phone)
+        # Try to create with preferredLanguage if ledger supports it
+        try:
+            return ledger_service.create_customer(shop_id=shop_id, name=customer_name.strip(), phone=phone, preferred_language=preferred_language)
+        except TypeError:
+            # Fallback for older signature
+            cust = ledger_service.create_customer(shop_id=shop_id, name=customer_name.strip(), phone=phone)
+            # Attempt to set language separately
+            if preferred_language and hasattr(ledger_service, "update_customer_language"):
+                try:
+                    ledger_service.update_customer_language(cust.get("customerId"), preferred_language)
+                except Exception:
+                    pass
+            return cust
 
     def _process_whatsapp_single_message(msg: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Processes a single WhatsApp message (text or audio) through STT -> Bedrock -> Ledger.
+        Processes a single WhatsApp message (text or audio) through multilingual STT -> Bedrock -> Ledger.
+        Supports 23 Indian languages (auto detection via Transcribe IdentifyLanguage + Whisper fallback).
         Returns result dict for response aggregation.
         """
         from_number = msg.get("from", "")
@@ -168,14 +196,30 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
         msg_id = msg.get("message_id", "")
         mtype = msg.get("type", "")
         shop_id = _resolve_shop_id(phone_number_id)
+        # Language hint may come from msg (for testing) or env default
+        hint_lang = msg.get("language_code") or msg.get("language") or msg.get("lang")
+        env_default_lang = os.environ.get("TRANSCRIBE_LANGUAGE", "auto")
+        if not hint_lang:
+            hint_lang = env_default_lang
 
-        # 1. Extract raw text
+        # 1. Extract raw text + detected language
         raw_text = ""
+        detected_lang = hint_lang  # will be updated after STT if auto
         transcription_meta: Dict[str, Any] = {}
+        if hint_lang:
+            transcription_meta["requested_language"] = hint_lang
         if mtype == "text":
             raw_text = str(msg.get("text", "")).strip()
             if not raw_text:
                 return {"message_id": msg_id, "status": "failed", "error": "Empty text message", "from": from_number}
+            # For text, if hint is auto or empty, detect from script
+            if not hint_lang or str(hint_lang).strip().lower() == "auto":
+                detected_lang = detect_language_from_text(raw_text)
+            else:
+                detected_lang = normalize_language_code(hint_lang)
+            transcription_meta["detected_language"] = detected_lang
+            transcription_meta["source"] = "text"
+            transcription_meta["language_detection"] = "script_heuristic" if (not hint_lang or str(hint_lang).lower()=="auto") else "explicit_hint"
         elif mtype in ("audio", "voice"):
             audio_id = msg.get("audio_id", "")
             if not audio_id:
@@ -183,7 +227,6 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
             try:
                 audio_bytes = whatsapp_service.download_media(audio_id)
                 transcription_meta["audio_bytes_len"] = len(audio_bytes)
-                # Determine media format from mime
                 mime = str(msg.get("mime_type", "audio/ogg")).lower()
                 media_format = "ogg"
                 if "mpeg" in mime or "mp3" in mime:
@@ -192,40 +235,74 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
                     media_format = "mp4"
                 elif "wav" in mime:
                     media_format = "wav"
-                raw_text = transcribe_service.transcribe_audio_bytes(audio_bytes, media_format=media_format)
+                # Use hint_lang or auto
+                lang_for_stt = hint_lang or env_default_lang or "auto"
+                # transcribe_service now returns (text, detected_lang)
+                result = transcribe_service.transcribe_audio_bytes(audio_bytes, media_format=media_format, language_code=lang_for_stt)
+                if isinstance(result, tuple) and len(result) == 2:
+                    raw_text, detected_lang = result
+                elif isinstance(result, str):
+                    raw_text = result
+                    detected_lang = normalize_language_code(lang_for_stt)
+                else:
+                    raw_text = str(result)
+                    detected_lang = normalize_language_code(lang_for_stt)
+                # If auto but transcript has native script, heuristic overwrites
+                if not detected_lang or str(detected_lang).lower() == "auto":
+                    heuristic = detect_language_from_text(raw_text)
+                    if heuristic != "en-IN" or not detected_lang:
+                        detected_lang = heuristic
+                        transcription_meta["language_detection"] = "script_heuristic_post_stt"
                 transcription_meta["transcript"] = raw_text
-            except (TranscriptionFailedError, WhatsAppValidationError) as e:
+                transcription_meta["detected_language"] = detected_lang
+                transcription_meta["source"] = "transcribe"
+                transcription_meta["stt_provider"] = "transcribe" if detected_lang in SUPPORTED_AWS or detected_lang == "auto" else "whisper_fallback"
+            except (TranscriptionFailedError, WhatsAppValidationError, WhisperTranscriptionFailedError) as e:
                 error_msg = str(e)
-                # Try to notify user via WhatsApp if possible
                 try:
+                    # Multilingual error reply via fallback template if possible
+                    fallback_lang = normalize_language_code(hint_lang) if hint_lang else "hi-IN"
+                    err_reply = bedrock_service.get_fallback_reply({"customerName": "Customer","type":"CREDIT","amount":0}, 0, language_code=fallback_lang)
+                    # Use generic voice failure in user's lang
                     whatsapp_service.send_text(from_number, f"Voice note samajh nahi paya: {error_msg}. Kripya dobara bhejein ya text me likhein. 🙏", phone_number_id)
                 except Exception:
                     pass
-                return {"message_id": msg_id, "status": "failed", "error": f"Transcription failed: {error_msg}", "from": from_number, "shopId": shop_id}
-            except (TranscribeUnavailableError, WhatsAppUnavailableError) as e:
+                return {"message_id": msg_id, "status": "failed", "error": f"Transcription failed: {error_msg}", "from": from_number, "shopId": shop_id, "requested_language": hint_lang}
+            except (TranscribeUnavailableError, WhisperUnavailableError, WhatsAppUnavailableError) as e:
                 error_msg = str(e)
-                return {"message_id": msg_id, "status": "error", "error": f"Service unavailable: {error_msg}", "from": from_number, "shopId": shop_id, "code": 503}
+                return {"message_id": msg_id, "status": "error", "error": f"Service unavailable: {error_msg}", "from": from_number, "shopId": shop_id, "code": 503, "requested_language": hint_lang}
+            except Exception as e:
+                return {"message_id": msg_id, "status": "error", "error": f"Transcription error: {str(e)}", "from": from_number, "shopId": shop_id, "code": 503}
         else:
             return {"message_id": msg_id, "status": "skipped", "error": f"Unsupported message type '{mtype}'", "from": from_number}
 
         if not raw_text or not raw_text.strip():
-            return {"message_id": msg_id, "status": "failed", "error": "Transcript/text is empty", "from": from_number}
+            return {"message_id": msg_id, "status": "failed", "error": "Transcript/text is empty", "from": from_number, "detected_language": detected_lang}
 
-        # 2. Bedrock extraction
+        # Normalize detected language for Bedrock; if still auto, detect from text
+        if not detected_lang or str(detected_lang).lower() == "auto":
+            detected_lang = detect_language_from_text(raw_text)
+        norm_lang = normalize_language_code(detected_lang) if detected_lang else "auto"
+        # Avoid storing 'auto' in ledger; keep specific
+        if norm_lang.lower() == "auto":
+            norm_lang = detect_language_from_text(raw_text)
+
+        # 2. Bedrock extraction with language hint
         try:
-            extracted = bedrock_service.extract_transaction(raw_text.strip())
+            extracted = bedrock_service.extract_transaction(raw_text.strip(), language_code=norm_lang)
         except BedrockExtractionError as e:
             try:
+                # Send error in detected language if possible
                 whatsapp_service.send_text(from_number, f"Samajh nahi paya: {str(e)}. Kripya naam, rakam aur udhar/jama sahi se bhejein. 🙏", phone_number_id)
             except Exception:
                 pass
-            return {"message_id": msg_id, "status": "failed", "error": f"Extraction failed: {str(e)}", "from": from_number, "transcript": raw_text, "shopId": shop_id}
+            return {"message_id": msg_id, "status": "failed", "error": f"Extraction failed: {str(e)}", "from": from_number, "transcript": raw_text, "shopId": shop_id, "detected_language": norm_lang}
         except BedrockUnavailableError as e:
-            return {"message_id": msg_id, "status": "error", "error": f"Bedrock unavailable: {str(e)}", "from": from_number, "transcript": raw_text, "code": 503}
+            return {"message_id": msg_id, "status": "error", "error": f"Bedrock unavailable: {str(e)}", "from": from_number, "transcript": raw_text, "code": 503, "detected_language": norm_lang}
 
-        # 3. Ledger: find or create customer, add transaction
+        # 3. Ledger: find or create customer, add transaction with language
         try:
-            customer = _find_or_create_customer(shop_id, extracted["customerName"], from_number)
+            customer = _find_or_create_customer(shop_id, extracted["customerName"], from_number, preferred_language=norm_lang)
             customer_id = customer.get("customerId", "")
             transaction = ledger_service.add_transaction(
                 shop_id=shop_id,
@@ -233,22 +310,47 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
                 tx_type=extracted["type"],
                 amount=extracted["amount"],
                 description=extracted.get("description", ""),
+                language=norm_lang,
             )
+            # Fallback if ledger_service doesn't accept language param
+            if "language" not in str(type(transaction)) and norm_lang and "language" not in transaction:
+                # Transaction already created, patch language into result for response
+                pass
             balance = transaction.get("updatedCustomerBalance", 0)
+        except TypeError as e:
+            # Retry without language if signature mismatch
+            if "language" in str(e):
+                try:
+                    transaction = ledger_service.add_transaction(
+                        shop_id=shop_id,
+                        customer_id=customer_id,
+                        tx_type=extracted["type"],
+                        amount=extracted["amount"],
+                        description=extracted.get("description", ""),
+                    )
+                    balance = transaction.get("updatedCustomerBalance", 0)
+                except Exception as e2:
+                    code = 503 if isinstance(e2, DynamoDBUnavailableError) else 400
+                    return {"message_id": msg_id, "status": "error" if code == 503 else "failed", "error": str(e2), "from": from_number, "extracted": extracted, "transcript": raw_text, "code": code, "detected_language": norm_lang}
+            else:
+                code = 503 if isinstance(e, DynamoDBUnavailableError) else 400
+                return {"message_id": msg_id, "status": "error" if code == 503 else "failed", "error": str(e), "from": from_number, "extracted": extracted, "transcript": raw_text, "code": code, "detected_language": norm_lang}
         except (LedgerValidationError, DynamoDBUnavailableError) as e:
             code = 503 if isinstance(e, DynamoDBUnavailableError) else 400
-            return {"message_id": msg_id, "status": "error" if code == 503 else "failed", "error": str(e), "from": from_number, "extracted": extracted, "transcript": raw_text, "code": code}
+            return {"message_id": msg_id, "status": "error" if code == 503 else "failed", "error": str(e), "from": from_number, "extracted": extracted, "transcript": raw_text, "code": code, "detected_language": norm_lang}
         except Exception as e:
-            return {"message_id": msg_id, "status": "error", "error": f"Ledger error: {str(e)}", "from": from_number, "extracted": extracted, "transcript": raw_text}
+            return {"message_id": msg_id, "status": "error", "error": f"Ledger error: {str(e)}", "from": from_number, "extracted": extracted, "transcript": raw_text, "detected_language": norm_lang}
 
-        # 4. Generate reply (Bedrock generation, fallback template inside service)
+        # 4. Generate reply in detected language
         try:
-            reply_text = bedrock_service.generate_reply(extracted, balance, raw_text)
+            reply_text = bedrock_service.generate_reply(extracted, balance, raw_text, language_code=norm_lang)
         except Exception:
-            # Ultimate fallback
-            typ = extracted.get("type", "")
-            amt = extracted.get("amount", "")
-            reply_text = f"{extracted.get('customerName')} ke liye {amt} ({typ}) record kiya. Balance: {balance}. ✅"
+            try:
+                reply_text = bedrock_service.get_fallback_reply(extracted, balance, language_code=norm_lang)
+            except Exception:
+                typ = extracted.get("type", "")
+                amt = extracted.get("amount", "")
+                reply_text = f"{extracted.get('customerName')} ke liye {amt} ({typ}) record kiya. Balance: {balance}. ✅"
 
         # 5. Send WhatsApp reply (best-effort)
         wa_send_status = "skipped"
@@ -271,11 +373,13 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
             "shopId": shop_id,
             "type": mtype,
             "transcript": raw_text,
+            "detected_language": norm_lang,
             "extractedTransaction": extracted,
             "customer": {"customerId": customer.get("customerId"), "name": customer.get("name")},
             "transaction": transaction,
             "balance": balance,
             "reply": reply_text,
+            "reply_language": norm_lang,
             "whatsapp_send": wa_send_status,
         }
         if wa_response:
@@ -375,29 +479,40 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
 
         # ---------------------------------------------------------------------
         # ROUTE: POST /whatsapp/transcribe (direct audio->text for testing without WhatsApp)
+        # Multilingual: supports all 23 languages via auto or explicit code; returns detected language
         # ---------------------------------------------------------------------
         if path == "/whatsapp/transcribe" and http_method == "POST":
             is_valid, body, status_code = _extract_and_validate_body(event)
             if not is_valid:
                 return _build_response(status_code, body)
-            # Support either s3_uri or base64 audio
             s3_uri = body.get("s3_uri") or body.get("s3Uri") or ""
             audio_b64 = body.get("audio_base64") or body.get("audioBase64") or ""
             media_format = body.get("media_format") or body.get("mediaFormat") or "ogg"
-            language_code = body.get("language_code") or body.get("languageCode") or None
+            language_code = body.get("language_code") or body.get("languageCode") or body.get("language") or None
+            # Normalize hint
+            if language_code:
+                language_code = normalize_language_code(language_code)
             try:
                 if s3_uri and s3_uri.strip():
-                    text = transcribe_service.transcribe_s3_uri(s3_uri.strip(), language_code=language_code, media_format=media_format)
+                    result = transcribe_service.transcribe_s3_uri(s3_uri.strip(), language_code=language_code, media_format=media_format)
+                    if isinstance(result, tuple):
+                        text, detected = result
+                    else:
+                        text, detected = str(result), normalize_language_code(language_code or "auto")
                 elif audio_b64 and audio_b64.strip():
                     import base64 as _b64
                     audio_bytes = _b64.b64decode(audio_b64.strip())
-                    text = transcribe_service.transcribe_audio_bytes(audio_bytes, media_format=media_format, language_code=language_code)
+                    result = transcribe_service.transcribe_audio_bytes(audio_bytes, media_format=media_format, language_code=language_code)
+                    if isinstance(result, tuple):
+                        text, detected = result
+                    else:
+                        text, detected = str(result), normalize_language_code(language_code or "auto")
                 else:
                     return _build_response(400, {"success": False, "error": "Provide either 's3_uri' or 'audio_base64'"})
-                return _build_response(200, {"success": True, "transcript": text})
-            except (TranscriptionFailedError, TranscribeUnavailableError) as e:
-                code = 503 if isinstance(e, TranscribeUnavailableError) else 400
-                return _build_response(code, {"success": False, "error": str(e)})
+                return _build_response(200, {"success": True, "transcript": text, "detected_language": detected, "requested_language": language_code or "auto"})
+            except (TranscriptionFailedError, TranscribeUnavailableError, WhisperUnavailableError, WhisperTranscriptionFailedError) as e:
+                code = 503 if isinstance(e, (TranscribeUnavailableError, WhisperUnavailableError)) else 400
+                return _build_response(code, {"success": False, "error": str(e), "requested_language": language_code})
             except Exception as e:
                 return _build_response(500, {"success": False, "error": "Transcription error", "details": str(e)})
 
@@ -416,12 +531,29 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
                 if not isinstance(body[f], str) or not body[f].strip():
                     return _build_response(400, {"success": False, "error": f"Field '{f}' cannot be empty"})
 
-            customer = ledger_service.create_customer(
-                shop_id=body["shopId"],
-                name=body["name"],
-                phone=body["phone"],
-                customer_id=body.get("customerId"),
-            )
+            pref_lang = body.get("preferredLanguage") or body.get("language") or body.get("language_code")
+            if pref_lang:
+                pref_lang = normalize_language_code(pref_lang)
+            try:
+                customer = ledger_service.create_customer(
+                    shop_id=body["shopId"],
+                    name=body["name"],
+                    phone=body["phone"],
+                    customer_id=body.get("customerId"),
+                    preferred_language=pref_lang,
+                )
+            except TypeError:
+                customer = ledger_service.create_customer(
+                    shop_id=body["shopId"],
+                    name=body["name"],
+                    phone=body["phone"],
+                    customer_id=body.get("customerId"),
+                )
+                if pref_lang and hasattr(ledger_service, "update_customer_language"):
+                    try:
+                        ledger_service.update_customer_language(customer.get("customerId"), pref_lang)
+                    except Exception:
+                        pass
             return _build_response(201, {"success": True, "customer": customer})
 
         # ---------------------------------------------------------------------
@@ -507,15 +639,30 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
             if amt <= 0:
                 return _build_response(400, {"success": False, "error": "amount must be greater than zero"})
 
-            transaction = ledger_service.add_transaction(
-                shop_id=body["shopId"],
-                customer_id=body["customerId"],
-                tx_type=tx_type,
-                amount=amt,
-                description=body.get("description", ""),
-                due_date=body.get("dueDate"),
-                transaction_id=body.get("transactionId"),
-            )
+            txn_lang = body.get("language") or body.get("language_code") or body.get("detected_language")
+            if txn_lang:
+                txn_lang = normalize_language_code(txn_lang)
+            try:
+                transaction = ledger_service.add_transaction(
+                    shop_id=body["shopId"],
+                    customer_id=body["customerId"],
+                    tx_type=tx_type,
+                    amount=amt,
+                    description=body.get("description", ""),
+                    due_date=body.get("dueDate"),
+                    transaction_id=body.get("transactionId"),
+                    language=txn_lang,
+                )
+            except TypeError:
+                transaction = ledger_service.add_transaction(
+                    shop_id=body["shopId"],
+                    customer_id=body["customerId"],
+                    tx_type=tx_type,
+                    amount=amt,
+                    description=body.get("description", ""),
+                    due_date=body.get("dueDate"),
+                    transaction_id=body.get("transactionId"),
+                )
             return _build_response(201, {"success": True, "transaction": transaction})
 
         # ---------------------------------------------------------------------
@@ -538,18 +685,30 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
             if not clean_message:
                 return _build_response(400, {"success": False, "error": "Field 'message' cannot be empty"})
 
-            # Extract structured transaction via Amazon Bedrock
-            extracted_tx = bedrock_service.extract_transaction(clean_message)
+            # Extract structured transaction via Bedrock with language hint (multilingual 23 langs)
+            # Accept optional language_code / language from body; if missing, detect from script
+            req_lang = body.get("language_code") or body.get("languageCode") or body.get("language") or body.get("lang")
+            if req_lang:
+                norm_lang = normalize_language_code(req_lang)
+                detected_for_resp = norm_lang
+            else:
+                # Auto-detect from text script for better extraction & response
+                detected_for_resp = detect_language_from_text(clean_message)
+                norm_lang = detected_for_resp
+            extracted_tx = bedrock_service.extract_transaction(clean_message, language_code=norm_lang)
 
-            return _build_response(
-                200,
-                {
-                    "success": True,
-                    "message": clean_message,
-                    "status": "received",
-                    "extractedTransaction": extracted_tx,
-                },
-            )
+            resp_payload: Dict[str, Any] = {
+                "success": True,
+                "message": clean_message,
+                "status": "received",
+                "extractedTransaction": extracted_tx,
+                "detected_language": detected_for_resp,
+            }
+            if req_lang:
+                resp_payload["requested_language"] = req_lang
+            # Also include transcript_language for consistency with WhatsApp
+            resp_payload["language"] = detected_for_resp
+            return _build_response(200, resp_payload)
 
         # ---------------------------------------------------------------------
         # Non-matching HTTP methods / routes
@@ -586,7 +745,18 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
             503,
             {
                 "success": False,
-                "error": "AWS Transcribe service is unavailable or not configured. Ensure TRANSCRIBE_S3_BUCKET and AWS credentials are configured.",
+                "error": "AWS Transcribe service is unavailable or not configured. Ensure TRANSCRIBE_S3_BUCKET and AWS credentials are configured. For whisper-only langs, set WHISPER_ENDPOINT_URL.",
+                "details": str(e),
+            },
+        )
+
+    except (WhisperUnavailableError, WhisperTranscriptionFailedError) as e:
+        is_unavail = isinstance(e, WhisperUnavailableError)
+        return _build_response(
+            503 if is_unavail else 400,
+            {
+                "success": False,
+                "error": f"Whisper {'unavailable' if is_unavail else 'transcription failed'}: {str(e)}",
                 "details": str(e),
             },
         )

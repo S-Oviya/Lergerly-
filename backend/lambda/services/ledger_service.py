@@ -147,8 +147,10 @@ class LedgerService:
         name: str,
         phone: str,
         customer_id: Optional[str] = None,
+        preferred_language: Optional[str] = None,
+        language: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Creates a new customer under a specific shop."""
+        """Creates a new customer under a specific shop. Supports multilingual preferredLanguage (23 Indian langs)."""
         if not shop_id or not shop_id.strip():
             raise LedgerValidationError("shopId must not be empty")
         if not name or not name.strip():
@@ -158,6 +160,12 @@ class LedgerService:
 
         cid = customer_id.strip() if customer_id and customer_id.strip() else f"cust_{uuid.uuid4().hex[:12]}"
         created_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        lang = (preferred_language or language or "").strip() if (preferred_language or language) else ""
+        # Normalize: short code or full
+        if lang:
+            lang = lang.strip()
+        else:
+            lang = None
 
         customer_item = {
             "customerId": cid,
@@ -167,6 +175,9 @@ class LedgerService:
             "balance": Decimal("0"),
             "createdAt": created_at,
         }
+        if lang:
+            customer_item["preferredLanguage"] = lang
+            customer_item["language"] = lang
 
         table = self._get_table(self.customers_table_name)
         self._wrap_db_call(table.put_item, Item=customer_item)
@@ -264,6 +275,32 @@ class LedgerService:
     # -------------------------------------------------------------------------
     # 6. add_transaction()
     # -------------------------------------------------------------------------
+    def update_customer_language(self, customer_id: str, language: str) -> None:
+        """Updates customer's preferredLanguage (best-effort, for multilingual tracking)."""
+        if not customer_id or not language:
+            return
+        try:
+            table = self._get_table(self.customers_table_name)
+            self._wrap_db_call(
+                table.update_item,
+                Key={"customerId": customer_id.strip()},
+                UpdateExpression="SET preferredLanguage = :lang, #lang = :lang",
+                ExpressionAttributeNames={"#lang": "language"},
+                ExpressionAttributeValues={":lang": language.strip()},
+            )
+        except Exception:
+            # Fallback without alias if #lang not needed
+            try:
+                table = self._get_table(self.customers_table_name)
+                self._wrap_db_call(
+                    table.update_item,
+                    Key={"customerId": customer_id.strip()},
+                    UpdateExpression="SET preferredLanguage = :lang",
+                    ExpressionAttributeValues={":lang": language.strip()},
+                )
+            except Exception:
+                pass
+
     def add_transaction(
         self,
         shop_id: str,
@@ -273,9 +310,13 @@ class LedgerService:
         description: str = "",
         due_date: Optional[str] = None,
         transaction_id: Optional[str] = None,
+        language: Optional[str] = None,
+        transcript_language: Optional[str] = None,
+        detected_language: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Records a transaction (CREDIT or PAYMENT) and updates customer balance deterministically.
+        Supports multilingual: stores language of voice/text (23 Indian langs).
         """
         if not shop_id or not shop_id.strip():
             raise LedgerValidationError("shopId must not be empty")
@@ -301,6 +342,11 @@ class LedgerService:
         )
         created_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
+        # Resolve language (prefer explicit language > transcript_language > detected_language)
+        lang_to_store = (language or transcript_language or detected_language or "").strip() if (language or transcript_language or detected_language) else ""
+        if lang_to_store:
+            lang_to_store = lang_to_store.strip()
+
         tx_item = {
             "transactionId": tx_id,
             "shopId": shop_id.strip(),
@@ -312,6 +358,10 @@ class LedgerService:
         }
         if due_date and due_date.strip():
             tx_item["dueDate"] = due_date.strip()
+        if lang_to_store:
+            tx_item["language"] = lang_to_store
+            tx_item["transcriptLanguage"] = lang_to_store
+            tx_item["detected_language"] = lang_to_store
 
         # 1. Write the transaction record
         tx_table = self._get_table(self.transactions_table_name)
@@ -320,20 +370,41 @@ class LedgerService:
         # 2. Deterministically calculate the new customer balance from ledger
         updated_balance = self.calculate_customer_balance(customer_id.strip(), shop_id.strip())
 
-        # 3. Update the customer's balance field in the Customers table
+        # 3. Update the customer's balance field + language in Customers table
         cust_table = self._get_table(self.customers_table_name)
         try:
-            self._wrap_db_call(
-                cust_table.update_item,
-                Key={"customerId": customer_id.strip()},
-                UpdateExpression="SET balance = :bal",
-                ExpressionAttributeValues={":bal": updated_balance},
-            )
+            if lang_to_store:
+                self._wrap_db_call(
+                    cust_table.update_item,
+                    Key={"customerId": customer_id.strip()},
+                    UpdateExpression="SET balance = :bal, preferredLanguage = :lang",
+                    ExpressionAttributeValues={":bal": updated_balance, ":lang": lang_to_store},
+                )
+            else:
+                self._wrap_db_call(
+                    cust_table.update_item,
+                    Key={"customerId": customer_id.strip()},
+                    UpdateExpression="SET balance = :bal",
+                    ExpressionAttributeValues={":bal": updated_balance},
+                )
         except Exception:
-            pass
+            # Fallback balance only
+            try:
+                self._wrap_db_call(
+                    cust_table.update_item,
+                    Key={"customerId": customer_id.strip()},
+                    UpdateExpression="SET balance = :bal",
+                    ExpressionAttributeValues={":bal": updated_balance},
+                )
+            except Exception:
+                pass
 
         result = _to_serializable(tx_item)
         result["updatedCustomerBalance"] = (
             int(updated_balance) if updated_balance % 1 == 0 else float(updated_balance)
         )
+        # Expose language in result for API
+        if lang_to_store:
+            result["language"] = lang_to_store
+            result["detected_language"] = lang_to_store
         return result
