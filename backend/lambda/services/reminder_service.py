@@ -1,15 +1,14 @@
 """
-Reminder automation service for Ledgerly.
-Belongs to Person 2 (WhatsApp + Automation).
+Reminder automation service for Ledgerly (WhatsApp + Automation).
 
 Responsible ONLY for determining whether supplied transaction records require a reminder
 and formatting the corresponding WhatsApp reminder candidate.
 
 STRICT BOUNDARIES:
-- Does NOT calculate customer balances (Person 1 responsibility).
-- Does NOT query DynamoDB or any database (Person 1 responsibility).
-- Does NOT call Bedrock or any LLM (Person 1 responsibility).
-- Does NOT call Meta / WhatsApp API (future transport milestone).
+- Does NOT calculate customer balances (handled by ledger_service).
+- Does NOT query DynamoDB or any database (handled by DynamoDB data layer).
+- Does NOT call Bedrock or any LLM (handled by bedrock_service).
+- Does NOT call Meta / WhatsApp API directly (handled by whatsapp_service).
 - Operates entirely in-memory on data passed into it with an explicit injected 'today' date.
 """
 

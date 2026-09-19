@@ -1,6 +1,5 @@
 """
-Customer-facing payment reminder WhatsApp message templates for Ledgerly.
-Belongs to Person 2 (WhatsApp + Automation).
+Customer-facing payment reminder WhatsApp message templates for Ledgerly (WhatsApp + Automation).
 
 Responsible ONLY for generating polite, customer-facing reminder text.
 Strict boundary: Does NOT calculate balances, interest, or financial state.

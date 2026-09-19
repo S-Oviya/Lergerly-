@@ -1,25 +1,25 @@
 # WhatsApp Messaging & Bill Generation Layer
 
-This document details the reusable WhatsApp message-generation layer for **Ledgerly** built by **Person 2 (Automation / WhatsApp)**.
+This document details the reusable WhatsApp message-generation layer for **Ledgerly**.
 
 ---
 
-## 1. Person 2 Responsibility & Architecture Boundaries
+## 1. System Responsibilities & Architecture Boundaries
 
-In the Ledgerly multi-agent development structure, system responsibilities are partitioned as follows:
+In the Ledgerly architecture, system responsibilities are partitioned as follows:
 
-| System Layer | Owner | Responsibilities |
+| System Layer | Subsystem | Responsibilities |
 |---|---|---|
-| **Bedrock / AI Extraction** | **Person 1** | Voice-to-text integration, Amazon Bedrock Claude 3 extraction of natural-language kirana notes into structured JSON. |
-| **Deterministic Ledger & DynamoDB** | **Person 1** | DynamoDB data access, transaction history persistence, and deterministic customer balance calculation (`balance = total CREDIT - total PAYMENT`). |
-| **WhatsApp Message Generation** | **Person 2** | Pure deterministic formatting of customer-facing WhatsApp confirmations, payment receipts, and digital bills from structured transaction data. |
-| **Meta Cloud API Transport** *(Future)* | **Person 2** | Dispatching prepared messages through Meta's official WhatsApp Business Cloud API. |
+| **Bedrock / AI Extraction** | **AI / Extraction Layer** | Voice-to-text integration, Amazon Bedrock Claude 3 extraction of natural-language kirana notes into structured JSON. |
+| **Deterministic Ledger & DynamoDB** | **Ledger Layer** | DynamoDB data access, transaction history persistence, and deterministic customer balance calculation (`balance = total CREDIT - total PAYMENT`). |
+| **WhatsApp Message Generation** | **Messaging Service** | Pure deterministic formatting of customer-facing WhatsApp confirmations, payment receipts, and digital bills from structured transaction data. |
+| **Meta Cloud API Transport** | **WhatsApp Transport** | Dispatching prepared messages through Meta's official WhatsApp Business Cloud API. |
 
 ### Strict Boundaries
-- **No Balance Calculation**: Person 2's services (`bill_service.py` and `message_templates.py`) **never** calculate or modify customer balances. Deterministic balance math is strictly owned by Person 1 in `ledger_service.py`.
-- **No Direct DynamoDB Queries**: Person 2 operates purely on structured data passed into the service; it does not read or write to DynamoDB tables.
-- **No Direct Bedrock Invocations**: Entity extraction is completed by Person 1 before transaction data reaches this layer.
-- **No Live Meta API Calls in this Phase**: This phase establishes the message-generation contract and testing suite. Meta Cloud API network calls will be connected in the subsequent automation task.
+- **No Balance Calculation**: Messaging services (`bill_service.py` and `message_templates.py`) **never** calculate or modify customer balances. Deterministic balance math is strictly owned by `ledger_service.py`.
+- **No Direct DynamoDB Queries**: Messaging services operate purely on structured data passed into the service; they do not read or write to DynamoDB tables.
+- **No Direct Bedrock Invocations**: Entity extraction is completed before transaction data reaches this layer.
+- **No Live Meta API Calls in this Phase**: This phase establishes the message-generation contract and testing suite. Meta Cloud API network calls are handled by `whatsapp_service.py`.
 
 ---
 
@@ -32,24 +32,24 @@ Browser Speech Recognition (Web Speech API)
              ↓
 POST /message (API Gateway / Lambda)
              ↓
-Amazon Bedrock Extraction (Person 1)
+Amazon Bedrock Extraction
              ↓
 Structured Transaction Data
              ↓
-Ledger Service & DynamoDB Storage (Person 1)
+Ledger Service & DynamoDB Storage
              ↓
-BillService.generate_bill() (Person 2)
+BillService.generate_bill()
              ↓
 WhatsApp-Ready Formatted Text
              ↓
-(Future) WhatsAppService -> Meta WhatsApp Cloud API
+WhatsAppService -> Meta WhatsApp Cloud API
              ↓
 Customer WhatsApp Notification
 ```
 
 ---
 
-## 3. Input Structure Expected from Person 1
+## 3. Input Structure Expected by Messaging Services
 
 `BillService` accepts structured transaction dictionaries formatted in either **camelCase** (standard API Gateway/frontend contract) or **snake_case** (Python backend service convention).
 
@@ -173,20 +173,20 @@ Amount paid: ₹500
 ## 6. Financial Rule Isolation: Balance Calculation Ownership
 
 > [!IMPORTANT]
-> **Deterministic Balance Calculation is Strictly Person 1's Responsibility.**
+> **Deterministic Balance Calculation is Strictly Owned by LedgerService.**
 >
 > Customer balances in Ledgerly are computed exclusively via:
 > $$\text{balance} = \sum \text{CREDIT} - \sum \text{PAYMENT}$$
 >
 > - `message_templates.py` and `bill_service.py` **do not calculate, store, or modify balances**.
-> - Balance numbers must always originate from Person 1's `ledger_service.calculate_customer_balance()`.
+> - Balance numbers must always originate from `ledger_service.calculate_customer_balance()`.
 > - AI models (Amazon Bedrock) are prohibited from computing financial balances.
 
 ---
 
 ## 7. Future Connection Point: Meta WhatsApp Cloud API
 
-When live WhatsApp messaging is connected in the next automation milestone, `BillService` will integrate with the future `WhatsAppService`:
+When live WhatsApp messaging is connected in the next automation milestone, `BillService` will integrate with `WhatsAppService`:
 
 ```python
 # Future Integration Blueprint (Meta WhatsApp Cloud API)
@@ -197,7 +197,7 @@ class WhatsAppService:
         self.bill_service = BillService()
 
     def send_transaction_notification(self, customer_phone: str, transaction: dict) -> dict:
-        # 1. Generate formatted message via Person 2's service
+        # 1. Generate formatted message via BillService
         message_text = self.bill_service.generate_bill(transaction)
 
         # 2. Transmit via Meta Cloud API

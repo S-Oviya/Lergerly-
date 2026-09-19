@@ -1,4 +1,4 @@
-﻿# Ledgerly Services Package
+# Ledgerly Services Package
 from services.ledger_service import (
     LedgerService,
     DynamoDBUnavailableError,
@@ -30,6 +30,18 @@ try:
 except ImportError:
     WhisperService = None
     WhisperError = WhisperUnavailableError = WhisperTranscriptionFailedError = Exception
+from services.config import (
+    ConfigValidationError,
+    validate_environment,
+    validate_whatsapp_config,
+    validate_dynamodb_config,
+    validate_transcribe_config,
+    validate_bedrock_config,
+)
+from services.retry_helper import (
+    retry_with_backoff,
+    is_aws_transient_error,
+)
 
 __all__ = [
     "LedgerService",
@@ -54,4 +66,12 @@ __all__ = [
     "WhisperError",
     "WhisperUnavailableError",
     "WhisperTranscriptionFailedError",
+    "ConfigValidationError",
+    "validate_environment",
+    "validate_whatsapp_config",
+    "validate_dynamodb_config",
+    "validate_transcribe_config",
+    "validate_bedrock_config",
+    "retry_with_backoff",
+    "is_aws_transient_error",
 ]

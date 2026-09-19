@@ -1,5 +1,5 @@
 """
-Reusable WhatsApp message templates for Ledgerly (Person 2 - Automation / WhatsApp).
+Reusable WhatsApp message templates for Ledgerly (Automation / WhatsApp).
 Pure deterministic functions generating WhatsApp-ready text representations.
 """
 

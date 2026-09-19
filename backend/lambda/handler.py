@@ -1,4 +1,4 @@
-﻿"""
+"""
 Ledgerly - AWS Lambda Ingestion, Bedrock Extraction & DynamoDB Data Layer Handler
 Phase 3: Amazon Bedrock Natural-Language Extraction + REST Operations
 """
@@ -9,6 +9,7 @@ import json
 import re
 import base64
 import urllib.parse
+from decimal import Decimal
 from typing import Any, Dict, Tuple, Optional
 
 # Ensure services directory is resolvable in Lambda and local test runs
@@ -39,6 +40,7 @@ from services.whatsapp_service import (
     WhatsAppUnavailableError,
     WhatsAppValidationError,
 )
+from services.payment_reply_service import PaymentReplyService
 try:
     from services.whisper_service import WhisperService, WhisperUnavailableError, WhisperTranscriptionFailedError
 except ImportError:
@@ -50,12 +52,18 @@ ledger_service = LedgerService()
 bedrock_service = BedrockService()
 whatsapp_service = WhatsAppService()
 transcribe_service = TranscribeService()
+payment_reply_service = PaymentReplyService()
 
 
 def _build_response(status_code: int, payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Constructs an API Gateway compatible HTTP response dictionary with CORS headers.
     """
+    def _json_default(obj: Any) -> Any:
+        if isinstance(obj, Decimal):
+            return int(obj) if obj % 1 == 0 else float(obj)
+        return str(obj)
+
     return {
         "statusCode": status_code,
         "headers": {
@@ -64,7 +72,7 @@ def _build_response(status_code: int, payload: Dict[str, Any]) -> Dict[str, Any]
             "Access-Control-Allow-Headers": "Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token",
             "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
         },
-        "body": json.dumps(payload),
+        "body": json.dumps(payload, default=_json_default),
     }
 
 
@@ -185,6 +193,22 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
                     pass
             return cust
 
+    def _find_customer_by_phone(shop_id: str, phone: str) -> Optional[Dict[str, Any]]:
+        """Finds existing customer by phone number under shop_id."""
+        if not phone or not phone.strip():
+            return None
+        try:
+            customers = ledger_service.list_customers(shop_id)
+        except Exception:
+            customers = []
+        clean_p = re.sub(r"\D", "", phone)
+        for c in customers:
+            c_phone = re.sub(r"\D", "", str(c.get("phone", "")))
+            if clean_p and c_phone:
+                if clean_p == c_phone or (len(clean_p) >= 10 and len(c_phone) >= 10 and clean_p[-10:] == c_phone[-10:]):
+                    return c
+        return None
+
     def _process_whatsapp_single_message(msg: Dict[str, Any]) -> Dict[str, Any]:
         """
         Processes a single WhatsApp message (text or audio) through multilingual STT -> Bedrock -> Ledger.
@@ -287,6 +311,161 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
         if norm_lang.lower() == "auto":
             norm_lang = detect_language_from_text(raw_text)
 
+        # -----------------------------------------------------------------
+        # 1.5 Check for customer payment reply (e.g. "I paid ₹500")
+        # -----------------------------------------------------------------
+        supplied_name = msg.get("customerName") or msg.get("name") or msg.get("sender_name")
+        payment_check = payment_reply_service.parse(
+            raw_text.strip(),
+            customer_name=supplied_name,
+            language=norm_lang,
+        )
+
+        if payment_check is not None:
+            if payment_check.get("action") == "AMBIGUOUS":
+                # Ambiguous payment message (e.g. "paid", "settled", "paid 0") -> request clarification
+                clarification = "Please specify the payment amount (e.g. 'I paid ₹500')."
+                if norm_lang and norm_lang.startswith("hi"):
+                    clarification = "Kripya bhugtan ki rakam batayein (jaise: 'paid 500'). 🙏"
+                wa_send_status = "skipped"
+                wa_response = None
+                try:
+                    if whatsapp_service.access_token and from_number:
+                        wa_response = whatsapp_service.send_text(from_number, clarification, phone_number_id)
+                        wa_send_status = "sent"
+                    else:
+                        wa_send_status = "skipped_no_token"
+                except Exception as e:
+                    wa_send_status = f"failed: {str(e)}"
+
+                ambiguous_res: Dict[str, Any] = {
+                    "message_id": msg_id,
+                    "status": "ambiguous",
+                    "from": from_number,
+                    "shopId": shop_id,
+                    "type": mtype,
+                    "transcript": raw_text,
+                    "detected_language": norm_lang,
+                    "paymentIntent": payment_check,
+                    "reply": clarification,
+                    "whatsapp_send": wa_send_status,
+                }
+                if wa_response:
+                    ambiguous_res["whatsapp_response"] = wa_response
+                if transcription_meta:
+                    ambiguous_res["transcription_meta"] = transcription_meta
+                return ambiguous_res
+
+            if payment_check.get("action") == "PAYMENT":
+                # Identify customer using existing customer lookup mechanisms
+                customer = _find_customer_by_phone(shop_id, from_number)
+                if not customer:
+                    cust_name = supplied_name or (f"Customer ({from_number})" if from_number else "Customer")
+                    customer = _find_or_create_customer(shop_id, cust_name, from_number, preferred_language=norm_lang)
+                customer_id = customer.get("customerId", "")
+
+                # Idempotency check using msg_id to prevent duplicate payment transactions
+                payment_tx_id = f"wa_{msg_id}" if msg_id else None
+                existing_tx = None
+                if payment_tx_id:
+                    try:
+                        customer_txs = ledger_service.get_customer_transactions(customer_id, shop_id=shop_id)
+                        existing_tx = next((t for t in customer_txs if t.get("transactionId") == payment_tx_id), None)
+                    except Exception:
+                        existing_tx = None
+
+                is_duplicate = False
+                if existing_tx:
+                    transaction = existing_tx
+                    balance = ledger_service.calculate_customer_balance(customer_id, shop_id=shop_id)
+                    is_duplicate = True
+                else:
+                    # Record PAYMENT transaction in ledger
+                    payment_amount = payment_check["amount"]
+                    try:
+                        transaction = ledger_service.add_transaction(
+                            shop_id=shop_id,
+                            customer_id=customer_id,
+                            tx_type="PAYMENT",
+                            amount=payment_amount,
+                            description="Customer payment via WhatsApp",
+                            transaction_id=payment_tx_id,
+                            language=norm_lang,
+                        )
+                        balance = transaction.get("updatedCustomerBalance", 0)
+                    except TypeError as te:
+                        if "language" in str(te):
+                            transaction = ledger_service.add_transaction(
+                                shop_id=shop_id,
+                                customer_id=customer_id,
+                                tx_type="PAYMENT",
+                                amount=payment_amount,
+                                description="Customer payment via WhatsApp",
+                                transaction_id=payment_tx_id,
+                            )
+                            balance = transaction.get("updatedCustomerBalance", 0)
+                        else:
+                            code = 503 if isinstance(te, DynamoDBUnavailableError) else 400
+                            return {"message_id": msg_id, "status": "error" if code == 503 else "failed", "error": str(te), "from": from_number, "paymentIntent": payment_check, "transcript": raw_text, "code": code, "detected_language": norm_lang}
+                    except (LedgerValidationError, DynamoDBUnavailableError) as e:
+                        code = 503 if isinstance(e, DynamoDBUnavailableError) else 400
+                        return {"message_id": msg_id, "status": "error" if code == 503 else "failed", "error": str(e), "from": from_number, "paymentIntent": payment_check, "transcript": raw_text, "code": code, "detected_language": norm_lang}
+                    except Exception as e:
+                        return {"message_id": msg_id, "status": "error", "error": f"Ledger error: {str(e)}", "from": from_number, "paymentIntent": payment_check, "transcript": raw_text, "detected_language": norm_lang}
+
+                # Generate concise WhatsApp acknowledgment with deterministic balance
+                extracted_for_reply = {
+                    "customerName": customer.get("name", "Customer"),
+                    "type": "PAYMENT",
+                    "amount": payment_check["amount"],
+                    "description": "Customer payment via WhatsApp",
+                }
+                try:
+                    reply_text = bedrock_service.generate_reply(extracted_for_reply, balance, raw_text, language_code=norm_lang)
+                except Exception:
+                    try:
+                        reply_text = bedrock_service.get_fallback_reply(extracted_for_reply, balance, language_code=norm_lang)
+                    except Exception:
+                        reply_text = f"Payment of ₹{payment_check['amount']} recorded. Your remaining balance is ₹{balance}."
+
+                # Send WhatsApp acknowledgment
+                wa_send_status = "skipped"
+                wa_response = None
+                try:
+                    if whatsapp_service.access_token and from_number:
+                        wa_response = whatsapp_service.send_text(from_number, reply_text, phone_number_id)
+                        wa_send_status = "sent"
+                    else:
+                        wa_send_status = "skipped_no_token"
+                except (WhatsAppUnavailableError, WhatsAppValidationError) as e:
+                    wa_send_status = f"failed: {str(e)}"
+                except Exception as e:
+                    wa_send_status = f"failed: {str(e)}"
+
+                payment_res: Dict[str, Any] = {
+                    "message_id": msg_id,
+                    "status": "processed",
+                    "from": from_number,
+                    "shopId": shop_id,
+                    "type": mtype,
+                    "transcript": raw_text,
+                    "detected_language": norm_lang,
+                    "paymentIntent": payment_check,
+                    "customer": {"customerId": customer.get("customerId"), "name": customer.get("name")},
+                    "transaction": transaction,
+                    "balance": balance,
+                    "reply": reply_text,
+                    "reply_language": norm_lang,
+                    "whatsapp_send": wa_send_status,
+                }
+                if is_duplicate:
+                    payment_res["duplicate"] = True
+                if wa_response:
+                    payment_res["whatsapp_response"] = wa_response
+                if transcription_meta:
+                    payment_res["transcription_meta"] = transcription_meta
+                return payment_res
+
         # 2. Bedrock extraction with language hint
         try:
             extracted = bedrock_service.extract_transaction(raw_text.strip(), language_code=norm_lang)
@@ -300,26 +479,42 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
         except BedrockUnavailableError as e:
             return {"message_id": msg_id, "status": "error", "error": f"Bedrock unavailable: {str(e)}", "from": from_number, "transcript": raw_text, "code": 503, "detected_language": norm_lang}
 
-        # 3. Ledger: find or create customer, add transaction with language
+        # 3. Ledger: find or create customer, add transaction with language & idempotency
         try:
             customer = _find_or_create_customer(shop_id, extracted["customerName"], from_number, preferred_language=norm_lang)
             customer_id = customer.get("customerId", "")
-            transaction = ledger_service.add_transaction(
-                shop_id=shop_id,
-                customer_id=customer_id,
-                tx_type=extracted["type"],
-                amount=extracted["amount"],
-                description=extracted.get("description", ""),
-                language=norm_lang,
-            )
-            # Fallback if ledger_service doesn't accept language param
-            if "language" not in str(type(transaction)) and norm_lang and "language" not in transaction:
-                # Transaction already created, patch language into result for response
-                pass
-            balance = transaction.get("updatedCustomerBalance", 0)
+
+            # Idempotency check using msg_id to prevent duplicate transactions
+            tx_id = f"wa_{msg_id}" if msg_id else None
+            existing_tx = None
+            if tx_id:
+                try:
+                    customer_txs = ledger_service.get_customer_transactions(customer_id, shop_id=shop_id)
+                    existing_tx = next((t for t in customer_txs if t.get("transactionId") == tx_id), None)
+                    if not existing_tx and hasattr(ledger_service, "get_transaction"):
+                        existing_tx = ledger_service.get_transaction(tx_id)
+                except Exception:
+                    existing_tx = None
+
+            is_duplicate = False
+            if existing_tx:
+                transaction = existing_tx
+                balance = ledger_service.calculate_customer_balance(customer_id, shop_id=shop_id)
+                is_duplicate = True
+            else:
+                transaction = ledger_service.add_transaction(
+                    shop_id=shop_id,
+                    customer_id=customer_id,
+                    tx_type=extracted["type"],
+                    amount=extracted["amount"],
+                    description=extracted.get("description", ""),
+                    transaction_id=tx_id,
+                    language=norm_lang,
+                )
+                balance = transaction.get("updatedCustomerBalance", 0)
         except TypeError as e:
             # Retry without language if signature mismatch
-            if "language" in str(e):
+            if "language" in str(e) or "transaction_id" in str(e):
                 try:
                     transaction = ledger_service.add_transaction(
                         shop_id=shop_id,
@@ -327,6 +522,7 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
                         tx_type=extracted["type"],
                         amount=extracted["amount"],
                         description=extracted.get("description", ""),
+                        transaction_id=tx_id,
                     )
                     balance = transaction.get("updatedCustomerBalance", 0)
                 except Exception as e2:
@@ -382,6 +578,8 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
             "reply_language": norm_lang,
             "whatsapp_send": wa_send_status,
         }
+        if is_duplicate:
+            result["duplicate"] = True
         if wa_response:
             result["whatsapp_response"] = wa_response
         if transcription_meta:

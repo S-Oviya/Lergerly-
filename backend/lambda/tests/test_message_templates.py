@@ -1,5 +1,5 @@
 """
-Unit tests for WhatsApp message templates (Person 2 - Automation / WhatsApp).
+Unit tests for WhatsApp message templates (Automation / WhatsApp).
 Uses Python standard unittest library without requiring external dependencies or credentials.
 """
 

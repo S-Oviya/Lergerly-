@@ -1,12 +1,12 @@
 """
-Bill representation and message generation service for Ledgerly (Person 2 - Automation / WhatsApp).
+Bill representation and message generation service for Ledgerly (Automation / WhatsApp).
 Responsible ONLY for generating WhatsApp-ready bill representations from structured transaction data.
 
 STRICT BOUNDARIES:
-- Does NOT calculate customer balances (Person 1 / ledger_service responsibility).
-- Does NOT query DynamoDB (Person 1 / DynamoDB layer responsibility).
-- Does NOT invoke Bedrock (Person 1 / bedrock_service responsibility).
-- Does NOT make live Meta WhatsApp Cloud API calls (future integration point).
+- Does NOT calculate customer balances (handled by ledger_service).
+- Does NOT query DynamoDB (handled by DynamoDB data layer).
+- Does NOT invoke Bedrock (handled by bedrock_service).
+- Does NOT make live Meta WhatsApp Cloud API calls (handled by whatsapp_service).
 """
 
 from typing import Any, Dict, Optional, Union

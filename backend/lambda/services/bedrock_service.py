@@ -1,4 +1,4 @@
-﻿"""
+"""
 Ledgerly - Amazon Bedrock Transaction Extraction Service
 Converts shopkeeper natural-language notes into structured transaction records.
 
@@ -362,12 +362,23 @@ class BedrockService:
         client = self._get_client()
         payload = self._build_model_payload(text.strip(), language_code=language_code)
 
-        try:
-            response = client.invoke_model(
+        from services.retry_helper import retry_with_backoff, is_aws_transient_error
+
+        def _do_invoke():
+            return client.invoke_model(
                 modelId=self.model_id,
                 body=json.dumps(payload),
                 contentType="application/json",
                 accept="application/json",
+            )
+
+        try:
+            response = retry_with_backoff(
+                _do_invoke,
+                max_retries=2,
+                base_delay=0.2,
+                max_delay=2.0,
+                is_retryable_fn=is_aws_transient_error,
             )
             raw_body = response.get("body")
             if hasattr(raw_body, "read"):
@@ -463,11 +474,22 @@ class BedrockService:
         try:
             client = self._get_client()
             payload = self._build_reply_payload(extracted, balance, original_text, language_code=language_code)
-            response = client.invoke_model(
-                modelId=self.model_id,
-                body=json.dumps(payload),
-                contentType="application/json",
-                accept="application/json",
+            from services.retry_helper import retry_with_backoff, is_aws_transient_error
+
+            def _do_reply_invoke():
+                return client.invoke_model(
+                    modelId=self.model_id,
+                    body=json.dumps(payload),
+                    contentType="application/json",
+                    accept="application/json",
+                )
+
+            response = retry_with_backoff(
+                _do_reply_invoke,
+                max_retries=2,
+                base_delay=0.2,
+                max_delay=2.0,
+                is_retryable_fn=is_aws_transient_error,
             )
             raw_body = response.get("body")
             if hasattr(raw_body, "read"):
@@ -486,5 +508,5 @@ class BedrockService:
                 text = re.sub(r"^```(?:[\w]+)?\s*", "", text)
                 text = re.sub(r"\s*```$", "", text)
             return text.strip()[:500]
-        except (BedrockUnavailableError, BedrockExtractionError):
+        except (BedrockUnavailableError, BedrockExtractionError, Exception):
             return self.get_fallback_reply(extracted, balance, language_code=language_code, original_text=original_text)

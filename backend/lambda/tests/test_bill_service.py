@@ -1,5 +1,5 @@
 """
-Unit tests for BillService (Person 2 - Automation / WhatsApp).
+Unit tests for BillService (Automation / WhatsApp).
 Verifies structured transaction -> WhatsApp bill message generation.
 """
 

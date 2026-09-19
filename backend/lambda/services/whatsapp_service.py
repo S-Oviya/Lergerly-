@@ -33,6 +33,23 @@ GRAPH_API_VERSION = os.environ.get("WHATSAPP_GRAPH_VERSION", "v18.0")
 GRAPH_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
 
+def is_transient_whatsapp_error(exc: Exception) -> bool:
+    """
+    Checks whether an error encountered when communicating with WhatsApp Graph API
+    is transient (e.g. rate limit 429, 5xx server error, network timeout) and should be retried.
+    Permanent errors (400 Bad Request, 401 Unauthorized, 403 Forbidden, 404 Not Found)
+    and validation errors must NOT be retried.
+    """
+    if isinstance(exc, WhatsAppValidationError):
+        return False
+    if isinstance(exc, urllib.error.HTTPError):
+        # 429 Too Many Requests, or 5xx Server Errors
+        return exc.code == 429 or 500 <= exc.code <= 599
+    if isinstance(exc, (urllib.error.URLError, TimeoutError)):
+        return True
+    return False
+
+
 class WhatsAppService:
     def __init__(
         self,
@@ -192,11 +209,20 @@ class WhatsAppService:
         return audio_bytes
 
     # ---------------------------------------------------------------------
-    # 4. Send text message
+    # 4. Send text message (with bounded exponential backoff on transient errors)
     # ---------------------------------------------------------------------
-    def send_text(self, to: str, text: str, phone_number_id: Optional[str] = None) -> Dict[str, Any]:
+    def send_text(
+        self,
+        to: str,
+        text: str,
+        phone_number_id: Optional[str] = None,
+        max_retries: Optional[int] = None,
+        backoff_base: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """
         Sends a WhatsApp text message via Graph API.
+        Retries transient failures (e.g. rate limit 429, 5xx server errors, network dropouts)
+        using bounded exponential backoff without retrying permanent validation/auth errors.
         Returns parsed JSON response.
         If WHATSAPP_TOKEN not configured, raises WhatsAppUnavailableError (caller may decide to skip).
         """
@@ -222,15 +248,39 @@ class WhatsAppService:
         req = urllib.request.Request(url, data=data, method="POST")
         req.add_header("Authorization", f"Bearer {self.access_token}")
         req.add_header("Content-Type", "application/json")
-        try:
+
+        retries = (
+            max_retries
+            if max_retries is not None
+            else int(os.environ.get("WHATSAPP_SEND_MAX_RETRIES", "2"))
+        )
+        base_delay = (
+            backoff_base
+            if backoff_base is not None
+            else float(os.environ.get("WHATSAPP_SEND_RETRY_BACKOFF_BASE", "0.2"))
+        )
+
+        def _do_send():
             with urllib.request.urlopen(req, timeout=10) as resp:
-                resp_data = json.loads(resp.read().decode("utf-8"))
-                return resp_data
+                return json.loads(resp.read().decode("utf-8"))
+
+        from services.retry_helper import retry_with_backoff
+
+        try:
+            return retry_with_backoff(
+                _do_send,
+                max_retries=retries,
+                base_delay=base_delay,
+                max_delay=2.0,
+                is_retryable_fn=is_transient_whatsapp_error,
+            )
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="ignore") if hasattr(e, "read") else str(e)
             raise WhatsAppUnavailableError(f"WhatsApp send failed [{e.code}]: {body}")
         except urllib.error.URLError as e:
             raise WhatsAppUnavailableError(f"WhatsApp send connection failed: {str(e)}")
+        except (WhatsAppValidationError, WhatsAppUnavailableError):
+            raise
         except Exception as e:
             raise WhatsAppUnavailableError(f"WhatsApp send error: {str(e)}")
 

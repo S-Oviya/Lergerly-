@@ -1,7 +1,7 @@
 """
-Unit tests for ReminderService (Person 2 - WhatsApp + Automation).
+Unit tests for ReminderService (WhatsApp + Automation).
 Verifies reminder logic, deterministic date comparison, duplicate suppression,
-and strict Person 1 / Person 2 boundaries (zero balance calculation).
+and architectural boundaries (zero balance calculation).
 """
 
 import os
@@ -225,7 +225,7 @@ class TestReminderService(unittest.TestCase):
 
     def test_service_does_not_calculate_customer_balances(self):
         """
-        12. Strict Person 1 / Person 2 boundary:
+        12. Strict architectural boundary:
         Two separate unpaid transactions for the SAME customer ('Rahul')
         are NOT merged, added, or balance-calculated. Each produces an independent candidate.
         """

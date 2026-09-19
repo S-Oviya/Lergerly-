@@ -1,5 +1,5 @@
 """
-Unit tests for Reminder Templates (Person 2 - WhatsApp + Automation).
+Unit tests for Reminder Templates (WhatsApp + Automation).
 Verifies customer-facing reminder text generation and input validations.
 """
 

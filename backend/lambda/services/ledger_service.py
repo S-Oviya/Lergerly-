@@ -1,4 +1,4 @@
-﻿"""
+"""
 Ledgerly - DynamoDB Data Layer & Deterministic Ledger Service
 Handles Shops, Customers, Transactions and exact balance arithmetic.
 """
@@ -245,6 +245,25 @@ class LedgerService:
         return _to_serializable(items)
 
     # -------------------------------------------------------------------------
+    # 4b. get_transaction() - Point lookup by transactionId primary key
+    # -------------------------------------------------------------------------
+    def get_transaction(self, transaction_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieves a single transaction by transactionId primary key."""
+        if not transaction_id or not str(transaction_id).strip():
+            return None
+        try:
+            table = self._get_table(self.transactions_table_name)
+            response = self._wrap_db_call(
+                table.get_item, Key={"transactionId": str(transaction_id).strip()}
+            )
+            item = response.get("Item")
+            if not item:
+                return None
+            return _to_serializable(item)
+        except Exception:
+            return None
+
+    # -------------------------------------------------------------------------
     # 5. calculate_customer_balance()
     # -------------------------------------------------------------------------
     def calculate_customer_balance(
@@ -340,6 +359,19 @@ class LedgerService:
             if transaction_id and transaction_id.strip()
             else f"tx_{uuid.uuid4().hex[:12]}"
         )
+
+        # Idempotency check: if transaction_id was supplied and already exists, return existing record
+        if transaction_id and transaction_id.strip():
+            existing = self.get_transaction(tx_id)
+            if existing:
+                updated_balance = self.calculate_customer_balance(customer_id.strip(), shop_id.strip())
+                existing_res = dict(existing)
+                existing_res["updatedCustomerBalance"] = (
+                    int(updated_balance) if updated_balance % 1 == 0 else float(updated_balance)
+                )
+                existing_res["is_duplicate"] = True
+                return existing_res
+
         created_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
         # Resolve language (prefer explicit language > transcript_language > detected_language)

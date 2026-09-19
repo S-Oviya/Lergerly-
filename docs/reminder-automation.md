@@ -1,21 +1,20 @@
 # Debt-Reminder Automation Layer
 
-This document describes the local debt-reminder automation layer for **Ledgerly**.
-This component belongs to **Person 2 — WhatsApp + Automation**.
+This document describes the local debt-reminder automation layer for **Ledgerly** (WhatsApp + Automation).
 
 ---
 
 ## 1. Role & Architectural Boundaries
 
-In Ledgerly's architecture, responsibilities are strictly separated between Person 1 and Person 2:
+In Ledgerly's architecture, responsibilities are strictly separated across layers:
 
-| System Layer | Owner | Responsibilities |
+| System Layer | Subsystem | Responsibilities |
 |---|---|---|
-| **AI / Extraction Layer** | **Person 1** | Voice-to-text processing, Amazon Bedrock extraction of natural-language notes into structured transactions. |
-| **Ledger & Financial State** | **Person 1** | DynamoDB data layer, customer balances, calculating outstanding debts via $\text{balance} = \sum \text{CREDIT} - \sum \text{PAYMENT}$. |
-| **Reminder Automation & Messaging** | **Person 2** | Pure evaluation of supplied records against an injected calendar date, duplicate reminder suppression, and customer-facing WhatsApp reminder generation. |
-| **WhatsApp Delivery Integration** | **Person 2** *(Future)* | Dispatching candidate messages via Meta WhatsApp Cloud API. |
-| **Scheduler Automation** | **Person 2** *(Future)* | Automated recurring cron triggers via AWS EventBridge Scheduler. |
+| **AI / Extraction Layer** | **AI / Extraction Layer** | Voice-to-text processing, Amazon Bedrock extraction of natural-language notes into structured transactions. |
+| **Ledger & Financial State** | **Ledger Layer** | DynamoDB data layer, customer balances, calculating outstanding debts via $\text{balance} = \sum \text{CREDIT} - \sum \text{PAYMENT}$. |
+| **Reminder Automation & Messaging** | **Reminder Service** | Pure evaluation of supplied records against an injected calendar date, duplicate reminder suppression, and customer-facing WhatsApp reminder generation. |
+| **WhatsApp Delivery Integration** | **WhatsApp Service** | Dispatching candidate messages via Meta WhatsApp Cloud API. |
+| **Scheduler Automation** | **Scheduler** | Automated recurring cron triggers via AWS EventBridge Scheduler. |
 
 ### Strict Financial Boundary
 
@@ -30,21 +29,21 @@ In Ledgerly's architecture, responsibilities are strictly separated between Pers
 > - Payment history
 > - Amount remaining after partial payments
 >
-> Those calculations are strictly Person 1's responsibility.
+> Those calculations are strictly the ledger service's responsibility.
 >
-> If Person 1 passes `{ "customerName": "Rahul", "amount": 500, "dueDate": "2026-09-20" }`, Person 2 treats **₹500** as the exact amount to communicate.
-> If a customer has multiple outstanding credit entries, Person 2 processes each transaction independently and **never sums them into a customer-level balance**.
+> If the ledger passes `{ "customerName": "Rahul", "amount": 500, "dueDate": "2026-09-20" }`, ReminderService treats **₹500** as the exact amount to communicate.
+> If a customer has multiple outstanding credit entries, ReminderService processes each transaction independently and **never sums them into a customer-level balance**.
 
 ---
 
 ## 2. Message Generation Workflow
 
 ```text
-Person 1 (Ledger / Storage Layer)
+Ledger / Storage Layer (DynamoDB)
         ↓
 Provides already-structured outstanding transaction record(s)
         ↓
-Person 2 ReminderService (services/reminder_service.py)
+ReminderService (services/reminder_service.py)
         ↓
 Evaluates transaction due date against injected `today`
         ↓
@@ -52,14 +51,14 @@ Determines status: DUE / OVERDUE
         ↓
 Generates WhatsApp-ready reminder (services/reminder_templates.py)
         ↓
-(Future) WhatsApp Business Cloud API
+WhatsApp Business Cloud API
         ↓
 Customer WhatsApp Notification
 ```
 
 ---
 
-## 3. Input Specification Expected from Person 1
+## 3. Input Specification Expected from Ledger Layer
 
 `ReminderService` accepts already-structured transaction dictionaries adhering to standard repository conventions:
 
@@ -180,11 +179,11 @@ AWS EventBridge Scheduler (Daily Cron e.g. cron(0 4 * * ? *))
         ↓
 AWS Lambda (Reminder Dispatcher Function)
         ↓
-Person 1 DynamoDB / Ledger Query (Fetch pending transactions with due dates)
+DynamoDB / Ledger Query (Fetch pending transactions with due dates)
         ↓
-Person 2 ReminderService (Evaluate due & overdue candidates)
+ReminderService (Evaluate due & overdue candidates)
         ↓
-Person 2 Reminder Templates (Render WhatsApp text)
+Reminder Templates (Render WhatsApp text)
         ↓
 Meta WhatsApp Business Cloud API (POST /v18.0/{phone_number_id}/messages)
         ↓

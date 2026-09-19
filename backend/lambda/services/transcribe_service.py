@@ -171,8 +171,20 @@ class TranscribeService:
                 "TRANSCRIBE_S3_BUCKET is not configured. Set env TRANSCRIBE_S3_BUCKET to a writable S3 bucket for voice transcription."
             )
         s3 = self._get_s3_client()
+        from services.retry_helper import retry_with_backoff, is_aws_transient_error
+
         try:
-            s3.put_object(Bucket=self.s3_bucket, Key=key, Body=audio_bytes, ContentType="audio/ogg")
+            retry_with_backoff(
+                s3.put_object,
+                Bucket=self.s3_bucket,
+                Key=key,
+                Body=audio_bytes,
+                ContentType="audio/ogg",
+                max_retries=2,
+                base_delay=0.2,
+                max_delay=2.0,
+                is_retryable_fn=is_aws_transient_error,
+            )
         except (NoCredentialsError, PartialCredentialsError) as e:
             raise TranscribeUnavailableError(f"AWS credentials not configured for S3: {str(e)}")
         except EndpointConnectionError as e:
@@ -197,8 +209,17 @@ class TranscribeService:
                     pass
                 raise TranscriptionFailedError(f"Transcription timed out after {timeout_seconds}s for job {job_name}")
 
+            from services.retry_helper import retry_with_backoff, is_aws_transient_error
+
             try:
-                resp = transcribe.get_transcription_job(TranscriptionJobName=job_name)
+                resp = retry_with_backoff(
+                    transcribe.get_transcription_job,
+                    TranscriptionJobName=job_name,
+                    max_retries=2,
+                    base_delay=0.2,
+                    max_delay=2.0,
+                    is_retryable_fn=is_aws_transient_error,
+                )
             except ClientError as e:
                 code = e.response.get("Error", {}).get("Code", "Unknown")
                 msg = e.response.get("Error", {}).get("Message", str(e))
@@ -327,7 +348,15 @@ class TranscribeService:
                 else:
                     kwargs["LanguageCode"] = aws_code
 
-            transcribe.start_transcription_job(**kwargs)
+            from services.retry_helper import retry_with_backoff, is_aws_transient_error
+
+            retry_with_backoff(
+                lambda: transcribe.start_transcription_job(**kwargs),
+                max_retries=2,
+                base_delay=0.2,
+                max_delay=2.0,
+                is_retryable_fn=is_aws_transient_error,
+            )
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code", "Unknown")
             msg = e.response.get("Error", {}).get("Message", str(e))
